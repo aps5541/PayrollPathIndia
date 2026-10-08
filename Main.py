@@ -290,10 +290,7 @@ CALC_PROMPTS = {
     "calc_ctc": "Apna *Annual CTC* bhejo (sirf number, e.g. 600000):",
     "calc_ctc_new": (
         "New Wage CTC breakup ke liye apna *Annual CTC* bhejo "
-        "(sirf number, e.g. `600000`).\n"
-        "Optional: employer-paid *annual insurance/other benefit* comma ke "
-        "baad (e.g. `600000,12000`):"
-    ),
+        "(sirf number, e.g. `600000`).\n"),
     "calc_regime": (
         "Format me bhejo: *AnnualGross,OldRegimeDeductions* — deductions me "
         "80C + 80D + NPS + HRA exemption + home loan interest etc. ka total "
