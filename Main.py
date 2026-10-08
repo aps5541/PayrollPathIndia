@@ -278,7 +278,7 @@ async def send_info(key, update, context, via_button):
 
 CALC_PROMPTS = {
     "calc_pf": (
-        "Basic+DA* "
+        "Basic+DA*",
         "bhejo — comma-separated, "
         "without thousands commas (e.g. `30000,15000`):"
     ),
