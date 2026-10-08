@@ -278,7 +278,7 @@ async def send_info(key, update, context, via_button):
 
 CALC_PROMPTS = {
     "calc_pf": (
-        "Monthly *gross remuneration (include OT/variable pay),Basic+DA* "
+        "Basic+DA* "
         "bhejo — comma-separated, "
         "without thousands commas (e.g. `30000,15000`):"
     ),
@@ -297,7 +297,7 @@ CALC_PROMPTS = {
         "(e.g. `1200000,350000`). Deductions nahi ho to `1200000,0`:"
     ),
     "calc_salary": (
-        "Monthly *gross remuneration (include OT/variable pay),Basic+DA* "
+        "Monthly *gross remuneration/CTC (include OT/variable pay),Basic+DA* "
         "bhejo — comma-separated, "
         "without thousands commas (e.g. `30000,15000`):"
     ),
