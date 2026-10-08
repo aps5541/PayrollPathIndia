@@ -47,27 +47,15 @@ TAX_REGIME = 2
 OLD_DEDUCTIONS = 3
 OLD_AGE = 4
 
-# ---------------- STATUTORY PARAMETERS ----------------
 EPF_WAGE_CEILING = 25000
-ESIC_WAGE_CEILING = 21000  # ESIC coverage ceiling, tested on monthly GROSS wages
+ESIC_WAGE_CEILING = 21000
 
 # New-wage CTC components (employer side)
 EPF_ADMIN_RATE = 0.005  # EPF admin charges
 EDLI_RATE = 0.005  # EDLI contribution
 GRATUITY_MONTHLY_FACTOR = 15 / 26 / 12  # 15 days wages per year, accrued monthly
 BONUS_RATE_MIN = 0.0833  # statutory minimum bonus
-BONUS_ELIGIBILITY_WAGE = 21000  # Basic+DA limit for bonus eligibility
-BONUS_CALC_CEILING = 7000  # bonus calculation ceiling (or min wage, if higher)
-# State minimum wage applicable to your establishment. Set BONUS_MIN_WAGE in
-# Replit Secrets once; the bonus ceiling becomes max(7000, this value).
-BONUS_STATE_MIN_WAGE = float(os.environ.get("BONUS_MIN_WAGE", "0"))
-
-GRATUITY_CAP = 2000000  # statutory gratuity ceiling (₹20 lakh)
-NEW_WAGE_BASIC_SHARE = 0.50  # Basic+DA minimum share of gross (Code on Wages)
-
-# Overtime: ordinary rate = Basic+DA / (26 days x 8 hours); OT paid at 2x
-OT_DIVISOR_DAYS = 26
-OT_HOURS_PER_DAY = 8
+BONUS_ELIGIBILITY_WAGE = 21000
 
 # Support hours (IST). Outside this window users get a "late reply" notice.
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -118,17 +106,18 @@ def main_menu_keyboard():
             InlineKeyboardButton("⏰ Overtime", callback_data="calc_ot"),
         ],
         [
-            InlineKeyboardButton("🧮 Old vs New Regime", callback_data="calc_regime"),
-            InlineKeyboardButton("💡 Tax Saver", callback_data="info_taxsave"),
-        ],
-        [
             InlineKeyboardButton(
                 "📆 Compliance Calendar", callback_data="info_compliance"
             ),
             InlineKeyboardButton("📰 Updates", callback_data="info_updates"),
         ],
         [
+            InlineKeyboardButton("💡 Tax Saver", callback_data="info_taxsave"),
             InlineKeyboardButton("🔔 Daily Alerts", callback_data="info_subscribe"),
+        ],
+        [
+            InlineKeyboardButton("📁 HR Templates", callback_data="info_templates"),
+            InlineKeyboardButton("⭐ Premium", callback_data="info_premium"),
         ],
     ]
     return InlineKeyboardMarkup(buttons)
@@ -138,8 +127,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clear_calc_state(context)
     text = (
         "👋 *Welcome to PayrollPath India!*\n\n"
-        "Aapka free HR, payroll aur compliance assistant.\n"
-        "Neeche se calculator ya information option chuniye:"
+        "Your free HR & payroll compliance assistant.\n"
+        "Choose a calculator or info option below:"
     )
     await update.message.reply_text(
         text, parse_mode="Markdown", reply_markup=main_menu_keyboard()
@@ -149,18 +138,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "ℹ️ *Help*\n\n"
-        "/start se main menu kholiye, ya seedha command use kijiye:\n\n"
-        "*Calculators*\n"
-        "/pf — Basic+DA se PF\n"
-        "/esic — Gross se ESIC\n"
-        "/ctc /ctc_new — CTC breakup\n"
-        "/salary — Gross se net salary\n"
-        "/gratuity /bonus /leave /ot — Basic+DA se\n"
-        "/tds /regime — Annual gross se tax\n\n"
-        "*Information*\n"
-        "/taxsave /compliance /updates\n"
-        "/subscribe /unsubscribe — daily compliance alerts\n\n"
-        "/cancel — chalta hua calculator band karne ke liye"
+        "Use /start to open the main menu, or type a command directly:\n"
+        "/pf /esic /ctc /ctc_new /salary /gratuity /bonus /tds /leave /ot\n"
+        "/regime /taxsave /compliance /updates /templates /premium\n"
+        "/subscribe /unsubscribe (daily compliance alerts)"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -240,6 +221,18 @@ INFO_TEXT = {
         "80D → 126, NPS → 124); limits lagbhag same. Form 16 me naye numbers "
         "dikhenge.\n" + DISCLAIMER
     ),
+    "info_templates": (
+        "📁 *HR Templates*\n\n"
+        "Coming soon: offer letters, appointment letters, payslip "
+        "formats, FnF settlement templates. (This section is still "
+        "being built.)"
+    ),
+    "info_premium": (
+        "⭐ *Premium Tools*\n\n"
+        "Planned premium features: bulk payroll reports, state-wise "
+        "compliance tracker, auto-generated payslips. Payment system "
+        "coming in a later update."
+    ),
 }
 
 
@@ -282,24 +275,24 @@ async def send_info(key, update, context, via_button):
 
 
 # ---------------- CALCULATORS (conversation-based) ----------------
-# Input policy: every calculator asks only for the figure it actually needs.
-#   Gross wages  -> ESIC, Net Salary, TDS / Regime comparison, CTC
-#   Basic + DA   -> PF, Gratuity, Bonus, Leave Encashment, Overtime
 
 CALC_PROMPTS = {
     "calc_pf": (
-        "Employee ka monthly *Basic + DA* (PF wages) bhejo — sirf number, "
-        "e.g. `18000`.\n"
-        "_LOP ho to us month ki earned Basic+DA bhejo._"
+        "Monthly *gross remuneration (include OT/variable pay),Basic+DA* "
+        "bhejo — comma-separated, "
+        "without thousands commas (e.g. `30000,15000`):"
     ),
     "calc_esic": (
-        "Employee ki monthly *Gross wages* bhejo (OT/variable pay included) — "
-        "sirf number, e.g. `19500`:"
+        "Monthly *Basic+DA* "
+        "bhejo — comma-separated, "
+        "without thousands commas (e.g. `30000,15000`):"
     ),
-    "calc_ctc": "Apna *Annual CTC* bhejo (sirf number, e.g. `600000`):",
+    "calc_ctc": "Apna *Annual CTC* bhejo (sirf number, e.g. 600000):",
     "calc_ctc_new": (
         "New Wage CTC breakup ke liye apna *Annual CTC* bhejo "
-        "(sirf number, e.g. `600000`):"
+        "(sirf number, e.g. `600000`).\n"
+        "Optional: employer-paid *annual insurance/other benefit* comma ke "
+        "baad (e.g. `600000,12000`):"
     ),
     "calc_regime": (
         "Format me bhejo: *AnnualGross,OldRegimeDeductions* — deductions me "
@@ -307,24 +300,18 @@ CALC_PROMPTS = {
         "(e.g. `1200000,350000`). Deductions nahi ho to `1200000,0`:"
     ),
     "calc_salary": (
-        "Employee ki monthly *Gross salary* bhejo — sirf number, e.g. `30000`.\n"
-        "_Basic+DA gross ka 50% maana jayega (Code on Wages ka minimum)._"
+        "Monthly *gross remuneration (include OT/variable pay),Basic+DA* "
+        "bhejo — comma-separated, "
+        "without thousands commas (e.g. `30000,15000`):"
     ),
-    "calc_gratuity": (
-        "Format me bhejo: *Basic+DA,Years* (e.g. `20000,6`).\n"
-        "_Months ho to years decimal me likho: 6 saal 8 mahine = `6.67`. "
-        "6 mahine se zyada ka period poora saal gina jata hai._"
-    ),
-    "calc_bonus": "Monthly *Basic + DA* bhejo (sirf number, e.g. `18000`):",
+    "calc_gratuity": "Format me bhejo: *BasicDA,YearsOfService* (e.g. 20000,6):",
+    "calc_bonus": "Apna *monthly wage* bhejo (sirf number, max ₹21000 tak eligible):",
     "calc_tds": (
         "Apni *annual gross salary* bhejo (before tax; standard deduction "
         "calculator apply karega, e.g. `900000`):"
     ),
-    "calc_leave": "Format me bhejo: *MonthlyBasic+DA,ELDays* (e.g. `24000,15`):",
-    "calc_ot": (
-        "Format me bhejo: *MonthlyBasic+DA,OTHours* (e.g. `18000,10`).\n"
-        "_Rate = Basic+DA ÷ 26 din ÷ 8 ghante, OT 2x pe._"
-    ),
+    "calc_leave": ("Format me bhejo: *MonthlyBasic+DA,ELDays* (e.g. `24000,15`):"),
+    "calc_ot": "Format me bhejo: *HourlyRate,OvertimeHours* (e.g. 150,10):",
 }
 
 
@@ -340,106 +327,86 @@ async def calc_entry(key, update, context, via_button):
     return AMOUNT
 
 
-# ---------------- INPUT PARSING ----------------
+def parse_monthly_wages(v):
+    parts = v.split(",")
+    if len(parts) != 2:
+        raise ValueError("Enter gross remuneration and Basic+DA separated by a comma.")
+    gross = float(parts[0].strip().replace("₹", ""))
+    basic_da = float(parts[1].strip().replace("₹", ""))
+    if not math.isfinite(gross) or not math.isfinite(basic_da):
+        raise ValueError("Amounts must be finite numbers.")
+    if gross <= 0 or basic_da < 0 or basic_da > gross:
+        raise ValueError("Basic+DA must be between zero and gross remuneration.")
+    return gross, basic_da
 
 
-def parse_amount(value, allow_zero=False):
-    normalized = value.strip().replace("₹", "").replace(",", "").replace(" ", "")
-    amount = float(normalized)
-    if not math.isfinite(amount) or amount < 0 or (amount == 0 and not allow_zero):
-        raise ValueError("Enter a valid non-negative amount.")
-    return amount
-
-
-def split_values(value, min_count, max_count=None):
-    """Split a comma-separated input into trimmed, non-empty parts."""
-    max_count = max_count or min_count
-    parts = [p.strip() for p in value.split(",")]
-    if not (min_count <= len(parts) <= max_count) or any(p == "" for p in parts):
-        raise ValueError("Unexpected number of values.")
-    return parts
-
-
-# ---------------- ROUNDING ----------------
+def code_wage_base(gross, basic_da):
+    # Add back excluded allowances above 50% of total remuneration.
+    return max(basic_da, gross * 0.50)
 
 
 def round_contribution(amount):
-    """EPF-style rounding: 50 paise and above goes up to the next rupee."""
     return math.floor(amount + 0.5)
 
 
-def round_esic(amount):
-    """ESIC rounds any fraction of a rupee up to the next higher rupee."""
-    return math.ceil(round(amount, 6))
-
-
-# ---------------- PF / ESIC ----------------
-
-
 def calc_pf(v):
-    basic_da = parse_amount(v)
-    pf_wage = min(basic_da, EPF_WAGE_CEILING)
-    employee = round_contribution(pf_wage * 0.12)
+    gross, basic_da = parse_monthly_wages(v)
+    wage_base = code_wage_base(gross, basic_da)
+    pf_wage = min(wage_base, EPF_WAGE_CEILING)
+    emp = round_contribution(pf_wage * 0.12)
     employer_total = round_contribution(pf_wage * 0.12)
     eps = round_contribution(pf_wage * 0.0833)
     epf_employer = employer_total - eps
-    admin_edli = round_contribution(pf_wage * (EPF_ADMIN_RATE + EDLI_RATE))
     return (
         f"🏦 *PF Calculation (FY 2026–27)*\n"
+        f"Gross remuneration: ₹{gross:,.0f}\n"
         f"Basic+DA: ₹{basic_da:,.0f}\n"
+        f"Wage base after 50% rule: ₹{wage_base:,.2f}\n"
         f"PF contribution wage (₹{EPF_WAGE_CEILING:,.0f} ceiling): "
-        f"₹{pf_wage:,.0f}\n\n"
-        f"*Employee*\n"
-        f"Employee PF (12%): ₹{employee:,.0f}\n\n"
-        f"*Employer*\n"
-        f"EPS (8.33%): ₹{eps:,.0f}\n"
-        f"EPF balance (3.67%): ₹{epf_employer:,.0f}\n"
-        f"Total employer contribution (12%): ₹{employer_total:,.0f}\n"
-        f"EPF admin + EDLI (0.5% + 0.5%): ₹{admin_edli:,.0f}\n\n"
-        f"*Total PF remittance (employee + employer 12%): "
-        f"₹{employee + employer_total:,.0f}*\n\n"
-        f"_PF wages = Basic + DA + retaining allowance. Code on Wages ke "
-        f"hisaab se Basic+DA total remuneration ka kam se kam 50% hona "
-        f"chahiye. Assumes a covered EPF member and full-month wages from Oct "
-        f"2026 onward. September 2026 had a mid-month ceiling change; "
-        f"voluntary contributions above the statutory ceiling may differ. "
-        f"EPF admin charge ka minimum ₹500 per establishment alag se lagta "
-        f"hai._" + DISCLAIMER
+        f"₹{pf_wage:,.2f}\n"
+        f"Employee PF (12%): ₹{emp:,.0f}\n"
+        f"Employer EPS (8.33%): ₹{eps:,.0f}\n"
+        f"Employer EPF balance: ₹{epf_employer:,.0f}\n"
+        f"Total employer contribution (12%): ₹{employer_total:,.0f}\n\n"
+        f"_Assumes a covered EPF member and full-month wages from Oct 2026 "
+        f"onward. September 2026 had a mid-month ceiling change; voluntary "
+        f"contributions above the statutory ceiling may differ._" + DISCLAIMER
     )
 
 
 def calc_esic(v):
-    gross = parse_amount(v)
-    if gross > ESIC_WAGE_CEILING:
+    gross, basic_da = parse_monthly_wages(v)
+    wage_base = code_wage_base(gross, basic_da)
+    if wage_base > ESIC_WAGE_CEILING:
         return (
             f"🏥 *ESIC Calculation (FY 2026–27)*\n"
-            f"Gross wages: ₹{gross:,.0f}\n"
-            f"Gross wages monthly coverage ceiling ₹{ESIC_WAGE_CEILING:,.0f} se "
-            f"upar hain — *new ESIC contribution applicable nahi*.\n\n"
-            f"_Pehle se ESIC-covered employee ki wages contribution period ke "
-            f"beech me ceiling cross karein to us period ke end tak "
-            f"contribution jaari rehta hai._" + DISCLAIMER
+            f"Gross remuneration: ₹{gross:,.0f}\n"
+            f"Basic+DA: ₹{basic_da:,.0f}\n"
+            f"Wage base after 50% rule: ₹{wage_base:,.2f}\n"
+            f"Wage base is above the ₹{ESIC_WAGE_CEILING:,.0f} monthly "
+            f"coverage ceiling — *not eligible for a new ESIC contribution "
+            f"estimate*." + DISCLAIMER
         )
-    emp = round_esic(gross * 0.0075)
-    empr = round_esic(gross * 0.0325)
+    emp = round_contribution(wage_base * 0.0075)
+    empr = round_contribution(wage_base * 0.0325)
     return (
         f"🏥 *ESIC Calculation (FY 2026–27)*\n"
-        f"Gross wages: ₹{gross:,.0f}\n"
+        f"Gross remuneration: ₹{gross:,.0f}\n"
+        f"Basic+DA: ₹{basic_da:,.0f}\n"
+        f"Wage base after 50% rule: ₹{wage_base:,.2f}\n"
         f"Employee contribution (0.75%): ₹{emp:,.0f}\n"
         f"Employer contribution (3.25%): ₹{empr:,.0f}\n"
-        f"*Total contribution: ₹{emp + empr:,.0f}*\n\n"
-        f"_Coverage ₹{ESIC_WAGE_CEILING:,.0f} monthly gross wages par check "
-        f"hota hai (OT included). Contribution ka fraction agle rupee tak "
-        f"round-up hota hai. Daily average wage ₹176 ya kam ho to employee "
-        f"contribution nahi katta (sirf employer share)._" + DISCLAIMER
+        f"Total contribution: ₹{emp + empr:,.0f}\n\n"
+        f"_Eligibility uses the ₹{ESIC_WAGE_CEILING:,.0f} monthly wage "
+        f"ceiling. If an already-covered employee crosses it mid-period, "
+        f"continuation rules may apply._" + DISCLAIMER
     )
 
 
-# ---------------- CTC ----------------
-
-
 def calc_ctc(v):
-    ctc = parse_amount(v)
+    ctc = float(v)
+    if not math.isfinite(ctc) or ctc <= 0:
+        raise ValueError("CTC must be a positive number.")
     monthly_ctc = ctc / 12
     basic = monthly_ctc * 0.40
     hra = basic * 0.50
@@ -461,10 +428,11 @@ def calc_ctc(v):
 def new_wage_components(gross, insurance_monthly=0.0):
     """All monthly components for a given whole-rupee gross under the 50% wage rule."""
     gross = int(gross)
-    basic = math.ceil(gross * NEW_WAGE_BASIC_SHARE)  # Basic+DA never below 50%
+    basic = math.ceil(gross / 2)  # Basic+DA never below 50% of remuneration
     hra = round_contribution(basic * 0.50)
     special = gross - basic - hra
-    pf_wage = min(basic, EPF_WAGE_CEILING)
+    wage_base = code_wage_base(gross, basic)
+    pf_wage = min(wage_base, EPF_WAGE_CEILING)
 
     employee_pf = round_contribution(pf_wage * 0.12)
     employer_pf = round_contribution(pf_wage * 0.12)
@@ -472,9 +440,9 @@ def new_wage_components(gross, insurance_monthly=0.0):
     employer_epf = employer_pf - employer_eps
     edli_admin = round_contribution(pf_wage * (EPF_ADMIN_RATE + EDLI_RATE))
 
-    esic_applicable = gross <= ESIC_WAGE_CEILING  # tested on gross wages
-    employee_esic = round_esic(gross * 0.0075) if esic_applicable else 0
-    employer_esic = round_esic(gross * 0.0325) if esic_applicable else 0
+    esic_applicable = wage_base <= ESIC_WAGE_CEILING
+    employee_esic = round_contribution(wage_base * 0.0075) if esic_applicable else 0
+    employer_esic = round_contribution(wage_base * 0.0325) if esic_applicable else 0
 
     gratuity = round_contribution(basic * GRATUITY_MONTHLY_FACTOR)
     bonus = (
@@ -496,6 +464,7 @@ def new_wage_components(gross, insurance_monthly=0.0):
         "basic": basic,
         "hra": hra,
         "special": special,
+        "wage_base": wage_base,
         "pf_wage": pf_wage,
         "employee_pf": employee_pf,
         "employer_pf": employer_pf,
@@ -513,55 +482,40 @@ def new_wage_components(gross, insurance_monthly=0.0):
 
 
 def solve_new_wage_gross(monthly_ctc, insurance_monthly=0.0):
-    """Highest whole-rupee monthly gross whose total employer cost fits the CTC.
-
-    Employer cost drops at two thresholds (ESIC coverage ends above the ESIC
-    ceiling; bonus ends when Basic+DA crosses the bonus-eligibility limit), so
-    cost is not monotonic overall. It is monotonic inside each band, so each
-    band is searched separately, highest band first.
-    """
+    """Highest whole-rupee monthly gross whose total employer cost fits the CTC."""
 
     def cost(g):
         return new_wage_components(g, insurance_monthly)["total_cost"]
 
-    def highest_fit(lo, hi):
-        if hi < lo or cost(lo) > monthly_ctc:
-            return None
-        while lo < hi:
-            mid = (lo + hi + 1) // 2
-            if cost(mid) <= monthly_ctc:
-                lo = mid
-            else:
-                hi = mid - 1
-        return lo
-
-    cliffs = sorted(
-        {
-            ESIC_WAGE_CEILING,
-            int(BONUS_ELIGIBILITY_WAGE / NEW_WAGE_BASIC_SHARE),
-        }
-    )
-    bands = []
-    start = 1
-    for cliff in cliffs:
-        bands.append((start, cliff))
-        start = cliff + 1
-    bands.append((start, max(start, int(monthly_ctc))))
-
-    for lo, hi in reversed(bands):
-        found = highest_fit(lo, hi)
-        if found is not None:
-            return found
-    return 1
+    esic_top = 2 * ESIC_WAGE_CEILING  # gross at which Basic+DA hits the ESIC ceiling
+    if monthly_ctc <= cost(esic_top):
+        lo, hi = 1, esic_top  # ESIC-covered range
+    else:
+        lo, hi = esic_top + 1, max(esic_top + 1, int(monthly_ctc))
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if cost(mid) <= monthly_ctc:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
 
 
 def calc_ctc_new(v):
-    ctc = parse_amount(v)
+    parts = [p.strip() for p in v.split(",")]
+    if len(parts) not in (1, 2):
+        raise ValueError("Enter CTC, optionally followed by annual insurance.")
+    ctc = parse_annual_amount(parts[0])
     if ctc < 50000:
         raise ValueError("Enter the ANNUAL CTC in rupees.")
+    insurance_annual = (
+        parse_annual_amount(parts[1], allow_zero=True) if len(parts) == 2 else 0.0
+    )
+    if insurance_annual >= ctc * 0.5:
+        raise ValueError("Insurance/benefit amount is too large for this CTC.")
 
     monthly_ctc = ctc / 12
-    insurance_monthly = 0.0
+    insurance_monthly = insurance_annual / 12
     gross = solve_new_wage_gross(monthly_ctc, insurance_monthly)
     c = new_wage_components(gross, insurance_monthly)
 
@@ -578,7 +532,7 @@ def calc_ctc_new(v):
     unallocated = monthly_ctc - c["total_cost"]
 
     lines = [
-        "🆕 *New Wage CTC Breakup (FY 2026–27)*",
+        f"🆕 *New Wage CTC Breakup (FY 2026–27)*",
         f"Annual CTC: ₹{ctc:,.0f}  |  Monthly CTC: ₹{monthly_ctc:,.2f}",
         "",
         "*💰 Earnings (monthly)*",
@@ -595,7 +549,7 @@ def calc_ctc_new(v):
     if c["esic_applicable"]:
         lines.append(f"ESIC 3.25%: ₹{c['employer_esic']:,.0f}")
     else:
-        lines.append(f"ESIC: ₹0 (gross above ₹{ESIC_WAGE_CEILING:,.0f})")
+        lines.append(f"ESIC: ₹0 (wage base above ₹{ESIC_WAGE_CEILING:,.0f})")
     lines.append(f"Gratuity provision (4.81% of Basic): ₹{c['gratuity']:,.0f}")
     if c["bonus"]:
         lines.append(f"Statutory bonus provision (8.33% min): ₹{c['bonus']:,.0f}")
@@ -625,21 +579,19 @@ def calc_ctc_new(v):
         "_Annual view: "
         f"Gross ₹{c['gross'] * 12:,.0f} + employer-side ₹{total_employer * 12:,.0f}. "
         "Professional Tax and LWF are state-specific and not included. Bonus is "
-        "shown at the statutory minimum on actual Basic+DA (the Bonus Act "
-        "calculation ceiling of ₹7,000 / state minimum wage may reduce it). "
-        "Companies that pay variable pay, NPS, meal/LTA or other benefits will "
-        "have a different split._",
+        "shown at the statutory minimum (calculation ceiling per Bonus Act/state "
+        "minimum wage may apply). Companies that pay variable pay, NPS, meal/LTA "
+        "or other benefits will have a different split._",
     ]
     return "\n".join(lines) + DISCLAIMER
 
 
-# ---------------- TAX ----------------
-
-
 def calc_regime(v):
-    parts = split_values(v, 2)
-    gross = parse_amount(parts[0])
-    deductions = parse_amount(parts[1], allow_zero=True)
+    parts = v.split(",")
+    if len(parts) != 2:
+        raise ValueError("Enter annual gross and old-regime deductions.")
+    gross = parse_annual_amount(parts[0])
+    deductions = parse_annual_amount(parts[1], allow_zero=True)
     new = calculate_salary_tax(gross, "new")
     old = calculate_salary_tax(gross, "old", deductions)
     new_tax, old_tax = new["annual_tax"], old["annual_tax"]
@@ -692,6 +644,41 @@ def calc_regime(v):
         "deduct it from gross before using this tool._"
     )
     return result + DISCLAIMER
+
+
+def calc_gratuity(v):
+    basic_str, years_str = v.split(",")
+    basic = float(basic_str.strip())
+    years = float(years_str.strip())
+    if years < 5:
+        return (
+            f"Years of service ({years}) < 5 — generally *not eligible* "
+            f"for gratuity (unless fixed-term employee under new codes)." + DISCLAIMER
+        )
+    gratuity = (basic * 15 * years) / 26
+    return (
+        f"🎁 *Gratuity Calculation*\n"
+        f"Last drawn Basic+DA: ₹{basic:,.0f}\n"
+        f"Years of service: {years}\n"
+        f"*Gratuity amount: ₹{gratuity:,.2f}*" + DISCLAIMER
+    )
+
+
+def calc_bonus(v):
+    wage = float(v)
+    if wage > 21000:
+        return (
+            f"Wage ₹{wage:,.0f} > ₹21,000 — *not eligible* for statutory bonus."
+            + DISCLAIMER
+        )
+    min_bonus = wage * 12 * 0.0833
+    max_bonus = wage * 12 * 0.20
+    return (
+        f"🎯 *Bonus Range (annual)*\n"
+        f"Monthly wage: ₹{wage:,.0f}\n"
+        f"Minimum bonus (8.33%): ₹{min_bonus:,.2f}\n"
+        f"Maximum bonus (20%): ₹{max_bonus:,.2f}" + DISCLAIMER
+    )
 
 
 def slab_tax(taxable_income, regime, age_band="under_60"):
@@ -798,17 +785,14 @@ def calculate_salary_tax(annual_gross, regime, old_deductions=0, age_band="under
     }
 
 
-AGE_TEXT = {
-    "under_60": "under 60",
-    "60_to_79": "60–79",
-    "80_plus": "80+",
-}
-
-
 def build_tds_result(annual_gross, regime, old_deductions=0, age_band="under_60"):
     tax = calculate_salary_tax(annual_gross, regime, old_deductions, age_band)
     regime_name = "New" if regime == "new" else "Old"
-    age_text = AGE_TEXT[age_band]
+    age_text = {
+        "under_60": "under 60",
+        "60_to_79": "60–79",
+        "80_plus": "80+",
+    }[age_band]
     result = (
         f"🧾 *TDS Estimate — {regime_name} Regime (FY 2026–27)*\n"
         f"Annual gross salary: ₹{tax['annual_gross']:,.0f}\n"
@@ -833,24 +817,22 @@ def build_tds_result(annual_gross, regime, old_deductions=0, age_band="under_60"
 
 
 def build_net_salary_result(
-    monthly_gross, regime, old_deductions=0, age_band="under_60"
+    monthly_gross, basic_da, regime, old_deductions=0, age_band="under_60"
 ):
-    # Only gross is asked; Basic+DA is taken at the 50% statutory minimum.
-    basic_da = monthly_gross * NEW_WAGE_BASIC_SHARE
-    pf_wage = min(basic_da, EPF_WAGE_CEILING)
+    wage_base = code_wage_base(monthly_gross, basic_da)
+    pf_wage = min(wage_base, EPF_WAGE_CEILING)
     pf_employee = round_contribution(pf_wage * 0.12)
     esic_employee = (
-        round_esic(monthly_gross * 0.0075) if monthly_gross <= ESIC_WAGE_CEILING else 0
+        round_contribution(wage_base * 0.0075) if wage_base <= ESIC_WAGE_CEILING else 0
     )
     tax = calculate_salary_tax(monthly_gross * 12, regime, old_deductions, age_band)
     monthly_tds = tax["annual_tax"] / 12
     net = monthly_gross - pf_employee - esic_employee - monthly_tds
     regime_name = "New" if regime == "new" else "Old"
-    age_text = AGE_TEXT[age_band]
     esic_line = (
-        f"ESIC employee contribution (0.75%): ₹{esic_employee:,.0f}"
+        f"ESIC employee contribution: ₹{esic_employee:,.0f}"
         if esic_employee
-        else f"ESIC: not applicable (gross above ₹{ESIC_WAGE_CEILING:,.0f})"
+        else f"ESIC: not included (wage base exceeds ₹{ESIC_WAGE_CEILING:,.0f})"
     )
     old_deduction_line = (
         f"\nOld-regime deductions/exemptions: ₹{old_deductions:,.0f}"
@@ -859,119 +841,60 @@ def build_net_salary_result(
     )
     return (
         f"💵 *Net Salary Estimate — {regime_name} Regime*\n"
-        f"Monthly gross salary: ₹{monthly_gross:,.0f}\n"
-        f"Basic+DA (assumed 50% of gross): ₹{basic_da:,.0f}\n"
-        f"Employee PF (12%): ₹{pf_employee:,.0f}\n"
+        f"Monthly gross remuneration: ₹{monthly_gross:,.0f}\n"
+        f"Basic+DA: ₹{basic_da:,.0f}\n"
+        f"Wage base after 50% rule: ₹{wage_base:,.2f}\n"
+        f"Employee PF: ₹{pf_employee:,.0f}\n"
         f"{esic_line}\n"
         f"Taxable annual salary: ₹{tax['taxable_income']:,.0f}"
         f"{old_deduction_line}\n"
         f"Average monthly TDS: ₹{monthly_tds:,.0f}\n"
         f"Professional Tax: not included (state-specific)\n"
         f"*Estimated monthly net pay: ₹{net:,.0f}*\n\n"
-        f"_PF is worked out on Basic+DA assumed at 50% of gross; if your actual "
-        f"Basic+DA is higher, PF will be higher (up to the ₹{EPF_WAGE_CEILING:,.0f} "
-        f"wage ceiling). TDS includes the regime's standard deduction, applicable "
-        f"rebate, marginal relief, surcharge and 4% cess. Assumes a resident "
-        f"individual age {age_text}, salary income for 12 months, and no other "
-        f"income._" + DISCLAIMER
-    )
-
-
-# ---------------- OTHER BENEFITS ----------------
-
-
-def calc_gratuity(v):
-    parts = split_values(v, 2)
-    basic = parse_amount(parts[0])
-    years = parse_amount(parts[1], allow_zero=True)
-    if years < 5:
-        return (
-            f"Years of service ({years:g}) < 5 — generally *not eligible* "
-            f"for gratuity (death/disablement me 5 saal ki shart nahi; fixed-term "
-            f"employee ko new codes me 1 saal ke baad eligibility)." + DISCLAIMER
-        )
-    # Service beyond 6 months in the last year counts as a full year.
-    whole = math.floor(years)
-    counted_years = whole + (1 if years - whole > 0.5 else 0)
-    gratuity = (basic * 15 * counted_years) / 26
-    capped = min(gratuity, GRATUITY_CAP)
-    cap_note = (
-        f"\n⚠️ Statutory ceiling ₹{GRATUITY_CAP:,.0f} lagu hua "
-        f"(calculated ₹{gratuity:,.2f})."
-        if gratuity > GRATUITY_CAP
-        else ""
-    )
-    return (
-        f"🎁 *Gratuity Calculation*\n"
-        f"Last drawn Basic+DA: ₹{basic:,.0f}\n"
-        f"Service entered: {years:g} years → counted as {counted_years} years\n"
-        f"Formula: Basic+DA × 15 × years ÷ 26\n"
-        f"*Gratuity amount: ₹{capped:,.2f}*{cap_note}\n\n"
-        f"_Establishments not covered by the 26-day formula (seasonal) use "
-        f"7 days per season. Check your employer's applicable policy._" + DISCLAIMER
-    )
-
-
-def calc_bonus(v):
-    wage = parse_amount(v)
-    if wage > BONUS_ELIGIBILITY_WAGE:
-        return (
-            f"Basic+DA ₹{wage:,.0f} > ₹{BONUS_ELIGIBILITY_WAGE:,.0f} — "
-            f"*statutory bonus ke liye eligible nahi*." + DISCLAIMER
-        )
-    ceiling = max(BONUS_CALC_CEILING, BONUS_STATE_MIN_WAGE)
-    calc_wage = min(wage, ceiling)
-    min_bonus = calc_wage * 12 * 0.0833
-    max_bonus = calc_wage * 12 * 0.20
-    return (
-        f"🎯 *Statutory Bonus (annual)*\n"
-        f"Monthly Basic+DA: ₹{wage:,.0f}\n"
-        f"Calculation wage (ceiling ₹{ceiling:,.0f}): ₹{calc_wage:,.0f}\n"
-        f"Minimum bonus (8.33%): ₹{min_bonus:,.2f}\n"
-        f"Maximum bonus (20%): ₹{max_bonus:,.2f}\n\n"
-        f"_Eligibility: Basic+DA ₹{BONUS_ELIGIBILITY_WAGE:,.0f} tak aur saal me "
-        f"kam se kam 30 working days. Bonus ₹{BONUS_CALC_CEILING:,.0f} ya state "
-        f"minimum wage (jo zyada ho) tak ke wage par nikalta hai. Pro-rata bonus "
-        f"ke liye working months ke hisaab se adjust karein._" + DISCLAIMER
+        f"_TDS includes the regime's standard deduction, applicable rebate, "
+        f"marginal relief, surcharge and 4% cess. Assumes a resident individual age "
+        f"{ {'under_60': 'under 60', '60_to_79': '60–79', '80_plus': '80+'}[age_band] }, "
+        f"salary income for 12 months, and no other income._" + DISCLAIMER
     )
 
 
 def calc_leave(v):
-    parts = split_values(v, 2)
-    monthly_basic = parse_amount(parts[0])
-    days = parse_amount(parts[1], allow_zero=True)
+    parts = v.split(",")
+    if len(parts) != 2:
+        raise ValueError("Enter monthly basic and EL days separated by a comma.")
+    monthly_basic = float(parts[0].strip().replace("₹", ""))
+    days = float(parts[1].strip())
+    if (
+        not math.isfinite(monthly_basic)
+        or not math.isfinite(days)
+        or monthly_basic <= 0
+        or days < 0
+    ):
+        raise ValueError("Enter valid positive amounts.")
     per_day = monthly_basic / 30
     amount = per_day * days
     return (
         f"🏖 *Leave Encashment*\n"
         f"Monthly Basic+DA: ₹{monthly_basic:,.2f}\n"
-        f"Per day rate (Basic+DA ÷ 30): ₹{per_day:,.2f}\n"
+        f"Per day rate (Basic ÷ 30): ₹{per_day:,.2f}\n"
         f"EL days to encash: {days:g}\n"
         f"*Encashment amount: ₹{amount:,.2f}*\n\n"
         f"_Uses the 30-day divisor. Some employers use 26 days or actual "
-        f"calendar days, so follow your company leave policy. Retirement/"
-        f"resignation par tax treatment alag hota hai (Sec 10(10AA))._"
-        + DISCLAIMER
+        f"calendar days, so follow your company leave policy._" + DISCLAIMER
     )
 
 
 def calc_ot(v):
-    parts = split_values(v, 2)
-    basic_da = parse_amount(parts[0])
-    hours = parse_amount(parts[1], allow_zero=True)
-    hourly = basic_da / (OT_DIVISOR_DAYS * OT_HOURS_PER_DAY)
-    amount = hourly * 2 * hours
+    rate_str, hours_str = v.split(",")
+    rate = float(rate_str.strip())
+    hours = float(hours_str.strip())
+    amount = rate * 2 * hours
     return (
         f"⏰ *Overtime Pay*\n"
-        f"Monthly Basic+DA: ₹{basic_da:,.2f}\n"
-        f"Ordinary hourly rate (÷ {OT_DIVISOR_DAYS} days ÷ {OT_HOURS_PER_DAY} hrs): "
-        f"₹{hourly:,.2f}\n"
-        f"Overtime hours: {hours:g}\n"
-        f"Rate applied: 2x ordinary rate (₹{hourly * 2:,.2f}/hr)\n"
-        f"*Overtime pay: ₹{amount:,.2f}*\n\n"
-        f"_OT par PF nahi katta; ESIC wages me OT included hota hai. Divisor "
-        f"(26 ya 30 din) aur OT limits state rules / company policy ke hisaab "
-        f"se alag ho sakte hain._" + DISCLAIMER
+        f"Hourly rate: ₹{rate:,.2f}\n"
+        f"Overtime hours: {hours}\n"
+        f"Rate applied: 2x normal\n"
+        f"*Overtime pay: ₹{amount:,.2f}*" + DISCLAIMER
     )
 
 
@@ -986,6 +909,14 @@ CALC_FUNCS = {
     "calc_leave": calc_leave,
     "calc_ot": calc_ot,
 }
+
+
+def parse_annual_amount(value, allow_zero=False):
+    normalized = value.strip().replace("₹", "").replace(",", "").replace(" ", "")
+    amount = float(normalized)
+    if not math.isfinite(amount) or amount < 0 or (amount == 0 and not allow_zero):
+        raise ValueError("Enter a valid non-negative amount.")
+    return amount
 
 
 def tax_regime_keyboard():
@@ -1031,6 +962,7 @@ def build_selected_calculation(context, regime, old_deductions=0):
     if key == "calc_salary":
         return build_net_salary_result(
             data["monthly_gross"],
+            data["basic_da"],
             regime,
             old_deductions,
             age_band,
@@ -1048,8 +980,11 @@ async def receive_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     try:
         if key == "calc_salary":
-            monthly_gross = parse_amount(value)
-            context.user_data["calc_data"] = {"monthly_gross": monthly_gross}
+            gross, basic_da = parse_monthly_wages(value)
+            context.user_data["calc_data"] = {
+                "monthly_gross": gross,
+                "basic_da": basic_da,
+            }
             context.user_data["calc_step"] = "tax_regime"
             await update.message.reply_text(
                 "TDS ke liye tax regime chuno:",
@@ -1058,7 +993,7 @@ async def receive_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return TAX_REGIME
 
         if key == "calc_tds":
-            annual_gross = parse_amount(value)
+            annual_gross = parse_annual_amount(value)
             context.user_data["calc_data"] = {"annual_gross": annual_gross}
             context.user_data["calc_step"] = "tax_regime"
             await update.message.reply_text(
@@ -1070,7 +1005,7 @@ async def receive_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = CALC_FUNCS[key](value)
     except (ValueError, TypeError, OverflowError):
         await update.message.reply_text(
-            "⚠️ Input sahi format me bhejo.\n\n" + CALC_PROMPTS[key],
+            "⚠️ Input sahi format me bhejo. " + CALC_PROMPTS[key],
             parse_mode="Markdown",
         )
         return AMOUNT
@@ -1109,7 +1044,7 @@ async def select_old_regime_age(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
     age_band = query.data.removeprefix("taxage_")
-    if age_band not in AGE_TEXT:
+    if age_band not in {"under_60", "60_to_79", "80_plus"}:
         return OLD_AGE
     context.user_data["tax_age_band"] = age_band
     context.user_data["calc_step"] = "old_deductions"
@@ -1125,7 +1060,7 @@ async def select_old_regime_age(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def receive_old_deductions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        deductions = parse_amount(update.message.text, allow_zero=True)
+        deductions = parse_annual_amount(update.message.text, allow_zero=True)
         result = build_selected_calculation(context, "old", deductions)
     except (ValueError, TypeError, OverflowError, KeyError):
         await update.message.reply_text(
@@ -1199,9 +1134,7 @@ def subscribe_keyboard(chat_id):
     label = (
         "🔕 Daily alerts band karo" if subscribed else "🔔 Daily alerts chalu karo"
     )
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton(label, callback_data="info_subscribe")]]
-    )
+    return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data="info_subscribe")]])
 
 
 async def toggle_subscription(update, context, force=None):
@@ -1343,11 +1276,9 @@ async def build_updates_message():
     )
     due = upcoming_deadlines()
     if due:
-        text += (
-            "<b>⏳ Upcoming due dates</b>\n"
-            + "\n".join("• " + html.escape(d) for d in due)
-            + "\n\n"
-        )
+        text += "<b>⏳ Upcoming due dates</b>\n" + "\n".join(
+            "• " + html.escape(d) for d in due
+        ) + "\n\n"
     if items:
         fetched = datetime.fromisoformat(cache["fetched_at"]).astimezone(IST)
         text += (
@@ -1384,11 +1315,9 @@ async def broadcast_daily(app):
     text = f"🔔 <b>Daily Payroll &amp; Compliance Update — {today.strftime('%d %b %Y')}</b>\n\n"
     due = upcoming_deadlines(today.date())
     if due:
-        text += (
-            "<b>⏳ Upcoming due dates</b>\n"
-            + "\n".join("• " + html.escape(d) for d in due)
-            + "\n\n"
-        )
+        text += "<b>⏳ Upcoming due dates</b>\n" + "\n".join(
+            "• " + html.escape(d) for d in due
+        ) + "\n\n"
     if new_items:
         text += "<b>🗞 Naye headlines</b>\n" + format_news_items(new_items) + "\n\n"
     else:
@@ -1489,16 +1418,12 @@ async def route(key, update, context, via_button):
     elif key in INFO_TEXT:
         await send_info(key, update, context, via_button)
         return ConversationHandler.END
-    # Old/removed menu buttons (e.g. from earlier chats) land here.
-    await get_message(update).reply_text(
-        "Yeh option ab available nahi hai. /start se naya menu kholiye."
-    )
     return ConversationHandler.END
 
 
 # Direct command versions (e.g. /pf) also open the same calculator flow
 async def direct_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cmd = update.message.text.split()[0][1:].split("@")[0]  # strip "/" and @botname
+    cmd = update.message.text.split()[0][1:]  # strip "/"
     key = f"calc_{cmd}"
     if key in CALC_PROMPTS:
         return await calc_entry(key, update, context, via_button=False)
@@ -1540,7 +1465,7 @@ def main():
         "leave",
         "ot",
     ]
-    info_commands = ["compliance", "updates", "taxsave"]
+    info_commands = ["compliance", "updates", "taxsave", "templates", "premium"]
 
     conv = ConversationHandler(
         entry_points=(
@@ -1575,7 +1500,6 @@ def main():
     app.add_handler(conv)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("subscribe", subscribe_cmd))
     app.add_handler(CommandHandler("unsubscribe", unsubscribe_cmd))
     for c in info_commands:
