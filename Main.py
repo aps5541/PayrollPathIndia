@@ -58,6 +58,9 @@ GRATUITY_MONTHLY_FACTOR = 15 / 26 / 12  # 15 days wages per year, accrued monthl
 BONUS_RATE_MIN = 0.0833  # statutory minimum bonus
 BONUS_ELIGIBILITY_WAGE = 21000  # Basic+DA limit for bonus eligibility
 BONUS_CALC_CEILING = 7000  # bonus calculation ceiling (or min wage, if higher)
+# State minimum wage applicable to your establishment. Set BONUS_MIN_WAGE in
+# Replit Secrets once; the bonus ceiling becomes max(7000, this value).
+BONUS_STATE_MIN_WAGE = float(os.environ.get("BONUS_MIN_WAGE", "0"))
 
 GRATUITY_CAP = 2000000  # statutory gratuity ceiling (₹20 lakh)
 NEW_WAGE_BASIC_SHARE = 0.50  # Basic+DA minimum share of gross (Code on Wages)
@@ -296,9 +299,7 @@ CALC_PROMPTS = {
     "calc_ctc": "Apna *Annual CTC* bhejo (sirf number, e.g. `600000`):",
     "calc_ctc_new": (
         "New Wage CTC breakup ke liye apna *Annual CTC* bhejo "
-        "(sirf number, e.g. `600000`).\n"
-        "Optional: employer-paid *annual insurance/other benefit* comma ke "
-        "baad (e.g. `600000,12000`):"
+        "(sirf number, e.g. `600000`):"
     ),
     "calc_regime": (
         "Format me bhejo: *AnnualGross,OldRegimeDeductions* — deductions me "
@@ -314,11 +315,7 @@ CALC_PROMPTS = {
         "_Months ho to years decimal me likho: 6 saal 8 mahine = `6.67`. "
         "6 mahine se zyada ka period poora saal gina jata hai._"
     ),
-    "calc_bonus": (
-        "Monthly *Basic + DA* bhejo (e.g. `18000`).\n"
-        "_State minimum wage ₹7,000 se zyada ho to comma ke baad likho: "
-        "`18000,9500`._"
-    ),
+    "calc_bonus": "Monthly *Basic + DA* bhejo (sirf number, e.g. `18000`):",
     "calc_tds": (
         "Apni *annual gross salary* bhejo (before tax; standard deduction "
         "calculator apply karega, e.g. `900000`):"
@@ -559,16 +556,12 @@ def solve_new_wage_gross(monthly_ctc, insurance_monthly=0.0):
 
 
 def calc_ctc_new(v):
-    parts = split_values(v, 1, 2)
-    ctc = parse_amount(parts[0])
+    ctc = parse_amount(v)
     if ctc < 50000:
         raise ValueError("Enter the ANNUAL CTC in rupees.")
-    insurance_annual = parse_amount(parts[1], allow_zero=True) if len(parts) == 2 else 0.0
-    if insurance_annual >= ctc * 0.5:
-        raise ValueError("Insurance/benefit amount is too large for this CTC.")
 
     monthly_ctc = ctc / 12
-    insurance_monthly = insurance_annual / 12
+    insurance_monthly = 0.0
     gross = solve_new_wage_gross(monthly_ctc, insurance_monthly)
     c = new_wage_components(gross, insurance_monthly)
 
@@ -920,15 +913,13 @@ def calc_gratuity(v):
 
 
 def calc_bonus(v):
-    parts = split_values(v, 1, 2)
-    wage = parse_amount(parts[0])
-    min_wage = parse_amount(parts[1]) if len(parts) == 2 else 0.0
+    wage = parse_amount(v)
     if wage > BONUS_ELIGIBILITY_WAGE:
         return (
             f"Basic+DA ₹{wage:,.0f} > ₹{BONUS_ELIGIBILITY_WAGE:,.0f} — "
             f"*statutory bonus ke liye eligible nahi*." + DISCLAIMER
         )
-    ceiling = max(BONUS_CALC_CEILING, min_wage)
+    ceiling = max(BONUS_CALC_CEILING, BONUS_STATE_MIN_WAGE)
     calc_wage = min(wage, ceiling)
     min_bonus = calc_wage * 12 * 0.0833
     max_bonus = calc_wage * 12 * 0.20
