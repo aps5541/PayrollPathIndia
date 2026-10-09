@@ -1,27 +1,34 @@
 import os
-import re
 import asyncio
+import hashlib
 import html
 import json
 import logging
 import math
 import xml.etree.ElementTree as ET
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from urllib.parse import quote_plus
+from urllib.parse import quote, quote_plus
 
 import httpx
+import uvicorn
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import PlainTextResponse
+from starlette.routing import Route
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import Forbidden, BadRequest
 from telegram.ext import (
     ApplicationBuilder,
+    BasePersistence,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
     ConversationHandler,
     ContextTypes,
-    TypeHandler,
+    PersistenceInput,
     filters,
 )
 
@@ -40,6 +47,8 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_IDS = {
     int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()
 }
+
+YOUTUBE_URL = "https://www.youtube.com/@PayrollPathIndia"
 
 DISCLAIMER = (
     "\n\n⚠️ Indicative FY 2026–27 estimate only. Actual payroll depends on "
@@ -63,18 +72,17 @@ GRATUITY_MONTHLY_FACTOR = 15 / 26 / 12  # 15 days wages per year, accrued monthl
 BONUS_RATE_MIN = 0.0833  # statutory minimum bonus
 BONUS_ELIGIBILITY_WAGE = 21000
 
-# Support hours (IST). Outside this window users get a "late reply" notice.
 IST = timezone(timedelta(hours=5, minutes=30))
-OFFICE_START_HOUR = int(os.environ.get("OFFICE_START_HOUR", "10"))  # 10:00 AM
-OFFICE_END_HOUR = int(os.environ.get("OFFICE_END_HOUR", "18"))  # 06:00 PM
-AFTER_HOURS_NOTICE_GAP_HOURS = 6  # don't repeat the notice more often than this
 
-# Daily updates
-DAILY_UPDATE_HOUR_IST = int(os.environ.get("DAILY_UPDATE_HOUR_IST", "9"))
+# ---------------- STORAGE ----------------
+# Autoscale ka filesystem/memory persist nahi hota. Isliye Replit Database
+# (REPLIT_DB_URL) use hota hai. Agar wo env var na ho to local files use hongi.
 DATA_DIR = Path(os.environ.get("DATA_DIR", "bot_data"))
 SUBSCRIBERS_FILE = DATA_DIR / "subscribers.json"
 UPDATES_CACHE_FILE = DATA_DIR / "updates_cache.json"
 MINWAGE_FILE = DATA_DIR / "minimum_wages.json"
+USERDATA_FILE = DATA_DIR / "ptb_user_data.json"
+CONVERSATIONS_FILE = DATA_DIR / "ptb_conversations.json"
 UPDATES_CACHE_TTL_HOURS = 6
 MAX_UPDATE_ITEMS = 30
 UPDATE_QUERIES = [
@@ -82,9 +90,6 @@ UPDATE_QUERIES = [
     "Code on Wages rules notification",
     "EPFO circular notification",
     "ESIC notification circular",
-    "minimum wages revision notification",
-    "minimum wages hike state government",
-    "VDA revision minimum wages",
     "TDS salary CBDT circular",
     "professional tax labour welfare fund",
 ]
@@ -125,6 +130,143 @@ STATES = [
     "Ladakh",
 ]
 
+
+def _kv_url():
+    return os.environ.get("REPLIT_DB_URL")
+
+
+def load_json(path, default):
+    base = _kv_url()
+    if base:
+        try:
+            r = httpx.get(f"{base}/{quote(path.name)}", timeout=10)
+            if r.status_code == 200 and r.text:
+                return json.loads(r.text)
+            return default
+        except (httpx.HTTPError, json.JSONDecodeError):
+            logger.exception("KV read failed for %s", path.name)
+            return default
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return default
+
+
+def save_json(path, data):
+    payload = json.dumps(data, ensure_ascii=False, default=str)
+    base = _kv_url()
+    if base:
+        try:
+            httpx.post(base, data={path.name: payload}, timeout=10).raise_for_status()
+        except httpx.HTTPError:
+            logger.exception("KV write failed for %s", path.name)
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(payload)
+        os.replace(tmp, path)
+    except OSError:
+        logger.exception("Could not save %s", path)
+
+
+class StoragePersistence(BasePersistence):
+    """Saves user_data + conversation states in the same storage, so a
+    calculator step survives when the Autoscale instance sleeps."""
+
+    def __init__(self):
+        super().__init__(
+            store_data=PersistenceInput(
+                bot_data=False, chat_data=False, callback_data=False, user_data=True
+            )
+        )
+        self._user_data = None
+        self._conversations = None
+
+    # --- user data ---
+    def _load_users(self):
+        if self._user_data is None:
+            raw = load_json(USERDATA_FILE, {})
+            self._user_data = {int(k): v for k, v in raw.items()}
+        return self._user_data
+
+    def _save_users(self):
+        save_json(
+            USERDATA_FILE,
+            {str(k): v for k, v in self._load_users().items() if v},
+        )
+
+    async def get_user_data(self):
+        return {k: dict(v) for k, v in self._load_users().items()}
+
+    async def update_user_data(self, user_id, data):
+        self._load_users()[user_id] = json.loads(json.dumps(data, default=str))
+        self._save_users()
+
+    async def refresh_user_data(self, user_id, user_data):
+        pass
+
+    async def drop_user_data(self, user_id):
+        self._load_users().pop(user_id, None)
+        self._save_users()
+
+    # --- conversations ---
+    def _load_convs(self):
+        if self._conversations is None:
+            self._conversations = load_json(CONVERSATIONS_FILE, {})
+        return self._conversations
+
+    async def get_conversations(self, name):
+        out = {}
+        for k, v in self._load_convs().get(name, {}).items():
+            chat_id, user_id = k.split(",")
+            out[(int(chat_id), int(user_id))] = v
+        return out
+
+    async def update_conversation(self, name, key, new_state):
+        convs = self._load_convs().setdefault(name, {})
+        k = ",".join(str(x) for x in key)
+        if new_state is None:
+            convs.pop(k, None)
+        else:
+            convs[k] = new_state
+        save_json(CONVERSATIONS_FILE, self._load_convs())
+
+    # --- unused (disabled via store_data) ---
+    async def get_bot_data(self):
+        return {}
+
+    async def update_bot_data(self, data):
+        pass
+
+    async def refresh_bot_data(self, bot_data):
+        pass
+
+    async def get_chat_data(self):
+        return {}
+
+    async def update_chat_data(self, chat_id, data):
+        pass
+
+    async def refresh_chat_data(self, chat_id, chat_data):
+        pass
+
+    async def drop_chat_data(self, chat_id):
+        pass
+
+    async def get_callback_data(self):
+        return None
+
+    async def update_callback_data(self, data):
+        pass
+
+    async def flush(self):
+        if self._user_data is not None:
+            self._save_users()
+
+
 # ---------------- MAIN MENU ----------------
 
 
@@ -151,24 +293,30 @@ def main_menu_keyboard():
             InlineKeyboardButton("⏰ Overtime", callback_data="calc_ot"),
         ],
         [
-            InlineKeyboardButton("💰 State Min Wages", callback_data="mw_menu"),
             InlineKeyboardButton(
                 "📆 Compliance Calendar", callback_data="info_compliance"
             ),
-        ],
-        [
             InlineKeyboardButton("📰 Updates", callback_data="info_updates"),
+        ],
+        [
             InlineKeyboardButton("💡 Tax Saver", callback_data="info_taxsave"),
+            InlineKeyboardButton("🔔 Min Wage Alerts", callback_data="info_subscribe"),
         ],
         [
-            InlineKeyboardButton("🔔 Daily Alerts", callback_data="info_subscribe"),
             InlineKeyboardButton("📁 HR Templates", callback_data="info_templates"),
-        ],
-        [
             InlineKeyboardButton("⭐ Premium", callback_data="info_premium"),
         ],
     ]
     return InlineKeyboardMarkup(buttons)
+
+
+def no_preview_kwargs(kwargs=None):
+    kwargs = kwargs if kwargs is not None else {}
+    if LinkPreviewOptions is not None:
+        kwargs["link_preview_options"] = LinkPreviewOptions(is_disabled=True)
+    else:
+        kwargs["disable_web_page_preview"] = True
+    return kwargs
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -176,10 +324,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "👋 *Welcome to PayrollPath India!*\n\n"
         "Your free HR & payroll compliance assistant.\n"
-        "Choose a calculator or info option below:"
+        "Choose a calculator or info option below:\n\n"
+        "▶️ Payroll, PF, ESIC aur labour code ke videos ke liye hamara "
+        f"YouTube channel subscribe karo: [PayrollPath India]({YOUTUBE_URL})"
     )
     await update.message.reply_text(
-        text, parse_mode="Markdown", reply_markup=main_menu_keyboard()
+        text,
+        parse_mode="Markdown",
+        reply_markup=main_menu_keyboard(),
+        **no_preview_kwargs(),
     )
 
 
@@ -188,8 +341,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "ℹ️ *Help*\n\n"
         "Use /start to open the main menu, or type a command directly:\n"
         "/pf /esic /ctc /ctc_new /salary /gratuity /bonus /tds /leave /ot\n"
-        "/regime /taxsave /compliance /updates /minwage /templates /premium\n"
-        "/subscribe /unsubscribe (daily compliance + minimum wage alerts)"
+        "/regime /taxsave /compliance /updates /templates /premium\n"
+        "/subscribe /unsubscribe (state minimum wage change alerts)"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -298,10 +451,7 @@ def get_message(update):
 
 
 async def send_html(message, text, **kwargs):
-    if LinkPreviewOptions is not None:
-        kwargs["link_preview_options"] = LinkPreviewOptions(is_disabled=True)
-    else:
-        kwargs["disable_web_page_preview"] = True
+    no_preview_kwargs(kwargs)
     return await message.reply_text(text, parse_mode="HTML", **kwargs)
 
 
@@ -839,14 +989,17 @@ def calculate_salary_tax(annual_gross, regime, old_deductions=0, age_band="under
     }
 
 
+AGE_TEXT = {
+    "under_60": "under 60",
+    "60_to_79": "60–79",
+    "80_plus": "80+",
+}
+
+
 def build_tds_result(annual_gross, regime, old_deductions=0, age_band="under_60"):
     tax = calculate_salary_tax(annual_gross, regime, old_deductions, age_band)
     regime_name = "New" if regime == "new" else "Old"
-    age_text = {
-        "under_60": "under 60",
-        "60_to_79": "60–79",
-        "80_plus": "80+",
-    }[age_band]
+    age_text = AGE_TEXT[age_band]
     result = (
         f"🧾 *TDS Estimate — {regime_name} Regime (FY 2026–27)*\n"
         f"Annual gross salary: ₹{tax['annual_gross']:,.0f}\n"
@@ -883,6 +1036,7 @@ def build_net_salary_result(
     monthly_tds = tax["annual_tax"] / 12
     net = monthly_gross - pf_employee - esic_employee - monthly_tds
     regime_name = "New" if regime == "new" else "Old"
+    age_text = AGE_TEXT[age_band]
     esic_line = (
         f"ESIC employee contribution: ₹{esic_employee:,.0f}"
         if esic_employee
@@ -907,8 +1061,8 @@ def build_net_salary_result(
         f"*Estimated monthly net pay: ₹{net:,.0f}*\n\n"
         f"_TDS includes the regime's standard deduction, applicable rebate, "
         f"marginal relief, surcharge and 4% cess. Assumes a resident individual age "
-        f"{ {'under_60': 'under 60', '60_to_79': '60–79', '80_plus': '80+'}[age_band] }, "
-        f"salary income for 12 months, and no other income._" + DISCLAIMER
+        f"{age_text}, salary income for 12 months, and no other income._"
+        + DISCLAIMER
     )
 
 
@@ -1157,29 +1311,7 @@ async def restart_conversation(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 
-# ---------------- JSON STORAGE HELPERS ----------------
-
-
-def load_json(path, default):
-    try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return default
-
-
-def save_json(path, data):
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
-        os.replace(tmp, path)
-    except OSError:
-        logger.exception("Could not save %s", path)
-
-
-# ---------------- STATE MINIMUM WAGES ----------------
+# ---------------- STATE MINIMUM WAGES (admin + alerts) ----------------
 
 
 def load_minwages():
@@ -1191,67 +1323,63 @@ def load_minwages():
     return data
 
 
-def minwage_keyboard():
-    rows, row = [], []
-    for i, s in enumerate(STATES):
-        row.append(InlineKeyboardButton(s, callback_data=f"mw_{i}"))
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    return InlineKeyboardMarkup(rows)
+def get_subscribers():
+    return set(load_json(SUBSCRIBERS_FILE, []))
 
 
-def format_minwage(state):
-    rec = load_minwages()["states"].get(state)
-    if not rec:
-        return (
-            f"💰 <b>{html.escape(state)}</b>\n"
-            "Is state ka verified data abhi add nahi hua. Official labour "
-            "department notification check karo."
+async def notify_minwage_change(bot, state, effective, rates, old_rates, source):
+    """Send a minimum wage change alert to subscribers only."""
+    subs = get_subscribers()
+    if not subs:
+        return 0
+    lines = [
+        "🔔 <b>Minimum Wage Alert</b>",
+        f"<b>{html.escape(state)}</b> me minimum wages revise hue hain.",
+        f"Effective from: {html.escape(effective)}\n",
+        f"Unskilled: ₹{rates[0]:,.0f}/month",
+        f"Semi-skilled: ₹{rates[1]:,.0f}/month",
+        f"Skilled: ₹{rates[2]:,.0f}/month",
+        f"Highly skilled: ₹{rates[3]:,.0f}/month",
+    ]
+    if old_rates:
+        lines.append(
+            f"\n<i>Pehle: ₹{old_rates[0]:,.0f} / ₹{old_rates[1]:,.0f} / "
+            f"₹{old_rates[2]:,.0f} / ₹{old_rates[3]:,.0f}</i>"
         )
-    r = rec["rates"]
-    text = (
-        f"💰 <b>Minimum Wages — {html.escape(state)}</b>\n"
-        f"Effective from: {html.escape(rec['effective'])}\n\n"
-        f"Unskilled: ₹{r[0]:,.0f}/month\n"
-        f"Semi-skilled: ₹{r[1]:,.0f}/month\n"
-        f"Skilled: ₹{r[2]:,.0f}/month\n"
-        f"Highly skilled: ₹{r[3]:,.0f}/month\n"
-    )
-    if rec.get("source"):
-        text += (
-            f'\n<a href="{html.escape(rec["source"], quote=True)}">'
-            "Official source</a>\n"
+    if source:
+        lines.append(
+            f'\n<a href="{html.escape(source, quote=True)}">Official source</a>'
         )
-    text += (
-        f"\n<i>Last verified: {html.escape(rec.get('verified', 'n/a'))}. "
-        "Zone/area-wise rates, industry (scheduled employment) aur VDA alag ho "
-        "sakte hain — notification se confirm karo.</i>"
+    lines.append(
+        "\n<i>Zone/industry-wise rates aur VDA alag ho sakte hain — "
+        "notification se confirm karo.</i>"
     )
-    return text
+    text = "\n".join(lines)
+    kwargs = no_preview_kwargs({"parse_mode": "HTML"})
 
+    async def send_one(chat_id):
+        try:
+            await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+            return chat_id, True, False
+        except (Forbidden, BadRequest):
+            return chat_id, False, True  # blocked the bot / chat gone
+        except Exception:
+            logger.exception("Min wage alert to %s failed", chat_id)
+            return chat_id, False, False
 
-async def minwage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await get_message(update).reply_text(
-        "💰 State chuno (minimum wages):", reply_markup=minwage_keyboard()
-    )
-
-
-async def minwage_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data == "mw_menu":
-        await query.message.reply_text(
-            "💰 State chuno (minimum wages):", reply_markup=minwage_keyboard()
-        )
-        return
-    try:
-        state = STATES[int(query.data.removeprefix("mw_"))]
-    except (ValueError, IndexError):
-        return
-    await send_html(query.message, format_minwage(state))
+    sent = 0
+    ids = list(subs)
+    for i in range(0, len(ids), 25):  # stay under Telegram's ~30 msg/sec limit
+        results = await asyncio.gather(*(send_one(c) for c in ids[i : i + 25]))
+        for chat_id, ok, remove in results:
+            if ok:
+                sent += 1
+            if remove:
+                subs.discard(chat_id)
+        if i + 25 < len(ids):
+            await asyncio.sleep(1)
+    save_json(SUBSCRIBERS_FILE, sorted(subs))
+    return sent
 
 
 async def setwage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1301,10 +1429,25 @@ async def setwage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             }
         )
         data["changes"] = data["changes"][-100:]
-    save_json(MINWAGE_FILE, data)
+    save_json(MINWAGE_FILE, data)  # save first, so a retry never double-sends
+
+    sent = 0
+    if changed:
+        sent = await notify_minwage_change(
+            context.bot,
+            state,
+            effective,
+            rates,
+            old["rates"] if old else None,
+            source,
+        )
     await update.message.reply_text(
         f"✅ {state} minimum wages saved."
-        + (" Next daily alert me jayega." if changed else " (Rates same the, sirf verified date update hui.)")
+        + (
+            f" Alert {sent} subscribers ko bhej diya."
+            if changed
+            else " (Rates same the, koi alert nahi gaya.)"
+        )
     )
 
 
@@ -1319,43 +1462,21 @@ async def mwstatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     missing = [s for s in STATES if s not in data]
     lines = [f"Data added: {len(have)}/{len(STATES)}"]
     for s in have:
-        lines.append(f"✅ {s} — effective {data[s]['effective']}, verified {data[s].get('verified', 'n/a')}")
+        lines.append(
+            f"✅ {s} — effective {data[s]['effective']}, "
+            f"verified {data[s].get('verified', 'n/a')}"
+        )
     if missing:
         lines.append("\nPending: " + ", ".join(missing))
     await update.message.reply_text("\n".join(lines)[:4000])
 
 
-def tag_minwage_news(items):
-    """Headlines about minimum wage / VDA, with any state names found in the title."""
-    out = []
-    for it in items:
-        t = it["title"].lower()
-        if (
-            "minimum wage" in t
-            or re.search(r"\bvda\b", t)
-            or "dearness allowance" in t
-        ):
-            states = [
-                s
-                for s in STATES
-                if re.search(rf"\b{re.escape(s.lower())}\b", t)
-            ]
-            out.append((it, states))
-    return out
-
-
-# ---------------- DAILY UPDATES (news feed + subscriptions) ----------------
-
-
-def get_subscribers():
-    return set(load_json(SUBSCRIBERS_FILE, []))
+# ---------------- SUBSCRIPTIONS ----------------
 
 
 def subscribe_keyboard(chat_id):
     subscribed = chat_id in get_subscribers()
-    label = (
-        "🔕 Daily alerts band karo" if subscribed else "🔔 Daily alerts chalu karo"
-    )
+    label = "🔕 Alerts band karo" if subscribed else "🔔 Min wage alerts chalu karo"
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton(label, callback_data="info_subscribe")]]
     )
@@ -1369,13 +1490,12 @@ async def toggle_subscription(update, context, force=None):
     if turn_on:
         subs.add(chat_id)
         text = (
-            f"🔔 Daily alerts *ON*. Roz subah {DAILY_UPDATE_HOUR_IST}:00 IST par "
-            "labour code/compliance headlines, state minimum wage changes aur "
-            "upcoming due dates milenge. Band karne ke liye /unsubscribe."
+            "🔔 Min wage alerts *ON*. Jab bhi kisi state ka minimum wage "
+            "change hoga, aapko turant alert milega. Band karne ke liye /unsubscribe."
         )
     else:
         subs.discard(chat_id)
-        text = "🔕 Daily alerts *OFF*. Dobara chalu karne ke liye /subscribe."
+        text = "🔕 Min wage alerts *OFF*. Dobara chalu karne ke liye /subscribe."
     save_json(SUBSCRIBERS_FILE, sorted(subs))
     await get_message(update).reply_text(text, parse_mode="Markdown")
 
@@ -1386,6 +1506,9 @@ async def subscribe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def unsubscribe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await toggle_subscription(update, context, force="off")
+
+
+# ---------------- UPDATES (news feed, fetched only when user asks) ----------------
 
 
 async def fetch_news_query(client, query):
@@ -1469,30 +1592,6 @@ def format_news_items(items, limit=8):
     return "\n".join(lines)
 
 
-def format_minwage_alerts(changes, news):
-    """HTML block for verified (admin) changes + auto-detected headlines."""
-    lines = ["<b>💰 Minimum Wage Alerts</b>"]
-    for c in changes:
-        n = c["new"]
-        lines.append(
-            f"• <b>{html.escape(c['state'])}</b> — revised, effective "
-            f"{html.escape(c['effective'])}: Unskilled ₹{n[0]:,.0f}, "
-            f"Semi ₹{n[1]:,.0f}, Skilled ₹{n[2]:,.0f}, Highly ₹{n[3]:,.0f}"
-        )
-    for it, states in news:
-        tag = f" [{html.escape(', '.join(states))}]" if states else ""
-        day = datetime.fromisoformat(it["published"]).astimezone(IST).strftime("%d %b")
-        lines.append(
-            f'• <a href="{html.escape(it["link"], quote=True)}">'
-            f'{html.escape(it["title"])}</a>{tag} — {day}'
-        )
-    lines.append(
-        "<i>Headlines auto-fetch hoti hain; rates /minwage me verify hone ke baad "
-        "update hote hain.</i>"
-    )
-    return "\n".join(lines)
-
-
 def upcoming_deadlines(today=None, window_days=10):
     """Recurring due dates falling in the next `window_days` days."""
     today = today or datetime.now(IST).date()
@@ -1530,13 +1629,6 @@ async def build_updates_message():
             + "\n\n"
         )
     if items:
-        mw_news = tag_minwage_news(items)[:4]
-        if mw_news:
-            text += (
-                "<b>💰 Minimum wage headlines</b> (state rates ke liye /minwage)\n"
-                + format_news_items([it for it, _ in mw_news], limit=4)
-                + "\n\n"
-            )
         fetched = datetime.fromisoformat(cache["fetched_at"]).astimezone(IST)
         text += (
             f"<b>🗞 Latest headlines</b> (updated {fetched.strftime('%d %b, %H:%M')} IST)\n"
@@ -1551,127 +1643,6 @@ async def build_updates_message():
         "incometax.gov.in\n" + html.escape(DISCLAIMER.strip())
     )
     return truncate_html(text)
-
-
-async def broadcast_daily(app):
-    subs = get_subscribers()
-    if not subs:
-        return
-    cache = await refresh_updates(force=True)
-    items = cache.get("items", [])
-    sent_ids = set(cache.get("broadcast_ids", []))
-    cutoff = datetime.now(timezone.utc) - timedelta(days=2)
-    new_items = [
-        i
-        for i in items
-        if i["link"] not in sent_ids
-        and datetime.fromisoformat(i["published"]) >= cutoff
-    ]
-
-    # Minimum wage: verified changes not yet broadcast + new tagged headlines
-    mw_data = load_minwages()
-    mw_sent = set(cache.get("mw_sent", []))
-    new_mw_changes = [c for c in mw_data["changes"] if c["id"] not in mw_sent]
-    mw_news = tag_minwage_news(new_items)
-
-    today = datetime.now(IST)
-    text = f"🔔 <b>Daily Payroll &amp; Compliance Update — {today.strftime('%d %b %Y')}</b>\n\n"
-    due = upcoming_deadlines(today.date())
-    if due:
-        text += (
-            "<b>⏳ Upcoming due dates</b>\n"
-            + "\n".join("• " + html.escape(d) for d in due)
-            + "\n\n"
-        )
-    if new_mw_changes or mw_news:
-        text += format_minwage_alerts(new_mw_changes, mw_news) + "\n\n"
-    if new_items:
-        text += "<b>🗞 Naye headlines</b>\n" + format_news_items(new_items) + "\n\n"
-    else:
-        text += "Aaj labour code/compliance ke koi naye headlines nahi mile.\n\n"
-    text += "<i>Official notification se verify karo. /updates se poori list dekho, /minwage se state rates.</i>"
-    text = truncate_html(text)
-
-    for chat_id in list(subs):
-        try:
-            kwargs = {"parse_mode": "HTML"}
-            if LinkPreviewOptions is not None:
-                kwargs["link_preview_options"] = LinkPreviewOptions(is_disabled=True)
-            else:
-                kwargs["disable_web_page_preview"] = True
-            await app.bot.send_message(chat_id=chat_id, text=text, **kwargs)
-        except (Forbidden, BadRequest):
-            subs.discard(chat_id)  # blocked the bot / chat gone
-        except Exception:
-            logger.exception("Broadcast to %s failed", chat_id)
-        await asyncio.sleep(0.05)  # stay under Telegram rate limits
-
-    save_json(SUBSCRIBERS_FILE, sorted(subs))
-    cache["broadcast_ids"] = [i["link"] for i in items]
-    cache["mw_sent"] = [c["id"] for c in mw_data["changes"]]
-    save_json(UPDATES_CACHE_FILE, cache)
-
-
-async def daily_loop(app):
-    while True:
-        now = datetime.now(IST)
-        target = now.replace(
-            hour=DAILY_UPDATE_HOUR_IST, minute=0, second=0, microsecond=0
-        )
-        if target <= now:
-            target += timedelta(days=1)
-        await asyncio.sleep((target - now).total_seconds())
-        try:
-            await broadcast_daily(app)
-        except Exception:
-            logger.exception("Daily broadcast failed")
-
-
-async def post_init(app):
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    app.bot_data["daily_task"] = asyncio.create_task(daily_loop(app))
-
-
-async def post_shutdown(app):
-    task = app.bot_data.get("daily_task")
-    if task:
-        task.cancel()
-
-
-# ---------------- AFTER-HOURS NOTICE ----------------
-
-
-def is_office_hours(now=None):
-    now = now or datetime.now(IST)
-    return OFFICE_START_HOUR <= now.hour < OFFICE_END_HOUR
-
-
-async def after_hours_notice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Runs before every other handler (group -1); never blocks them."""
-    if is_office_hours() or not update.effective_chat:
-        return
-    # Only react to real user actions (messages / button taps)
-    if not (update.message or update.callback_query):
-        return
-    last = context.user_data.get("after_hours_notice_at")
-    now = datetime.now(timezone.utc)
-    if last and now - datetime.fromisoformat(last) < timedelta(
-        hours=AFTER_HOURS_NOTICE_GAP_HOURS
-    ):
-        return
-    context.user_data["after_hours_notice_at"] = now.isoformat()
-    try:
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=(
-                f"🕙 Hamari support timing {OFFICE_START_HOUR % 12 or 12}:00 AM – "
-                f"{OFFICE_END_HOUR % 12 or 12}:00 PM (IST) hai. Is time ke baad "
-                "message karne par reply late aa sakta hai. Calculators phir bhi "
-                "kaam karte rahenge."
-            ),
-        )
-    except Exception:
-        logger.exception("After-hours notice failed")
 
 
 # ---------------- ROUTER ----------------
@@ -1708,15 +1679,22 @@ async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-def main():
+async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Unhandled error", exc_info=context.error)
+
+
+# ---------------- APPLICATION (webhook mode) ----------------
+
+
+def build_application():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN not set. Add it in Replit Secrets.")
 
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
-        .post_init(post_init)
-        .post_shutdown(post_shutdown)
+        .updater(None)  # no polling; updates arrive via webhook
+        .persistence(StoragePersistence())
         .build()
     )
 
@@ -1762,17 +1740,15 @@ def main():
             CommandHandler("start", restart_conversation),
         ],
         allow_reentry=True,
+        name="calc_conversation",
+        persistent=True,
     )
 
-    app.add_handler(TypeHandler(Update, after_hours_notice), group=-1)
     app.add_handler(conv)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("subscribe", subscribe_cmd))
     app.add_handler(CommandHandler("unsubscribe", unsubscribe_cmd))
-    # Minimum wages
-    app.add_handler(CallbackQueryHandler(minwage_callback, pattern="^mw_"))
-    app.add_handler(CommandHandler("minwage", minwage_cmd))
     app.add_handler(CommandHandler("setwage", setwage_cmd))
     app.add_handler(CommandHandler("mwstatus", mwstatus_cmd))
     for c in info_commands:
@@ -1781,10 +1757,80 @@ def main():
         MessageHandler(filters.TEXT & ~filters.COMMAND, pending_amount_fallback)
     )
     app.add_handler(MessageHandler(filters.COMMAND, unknown))
+    app.add_error_handler(error_handler)
+    return app
 
-    print("Bot is running...")
-    app.run_polling()
 
+# ---------------- WEB SERVER (Autoscale) ----------------
+
+PORT = int(os.environ.get("PORT", "8080"))
+WEBHOOK_SECRET = (
+    hashlib.sha256(BOT_TOKEN.encode()).hexdigest()[:32] if BOT_TOKEN else ""
+)
+
+
+def webhook_base_url():
+    explicit = os.environ.get("WEBHOOK_URL", "").strip().rstrip("/")
+    if explicit:
+        return explicit
+    domains = os.environ.get("REPLIT_DOMAINS", "").split(",")
+    domain = domains[0].strip() if domains else ""
+    return f"https://{domain}" if domain else ""
+
+
+ptb_app = build_application()
+
+
+@asynccontextmanager
+async def lifespan(_app):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    await ptb_app.initialize()
+    try:
+        base = webhook_base_url()
+        if base:
+            target = f"{base}/telegram"
+            info = await ptb_app.bot.get_webhook_info()
+            if info.url != target:
+                await ptb_app.bot.set_webhook(
+                    url=target,
+                    secret_token=WEBHOOK_SECRET,
+                    allowed_updates=["message", "callback_query"],
+                )
+                logger.info("Webhook set to %s", target)
+        else:
+            logger.warning(
+                "WEBHOOK_URL / REPLIT_DOMAINS not set — webhook not registered."
+            )
+        yield
+    finally:
+        await ptb_app.shutdown()
+
+
+async def health(request: Request):
+    return PlainTextResponse("PayrollPath bot is running")
+
+
+async def telegram_webhook(request: Request):
+    if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
+        return PlainTextResponse("forbidden", status_code=403)
+    try:
+        data = await request.json()
+        update = Update.de_json(data, ptb_app.bot)
+        # Handle inside the request so the instance stays awake until done.
+        await ptb_app.process_update(update)
+    except Exception:
+        logger.exception("Update processing failed")
+    return PlainTextResponse("ok")  # always 200, so Telegram doesn't retry
+
+
+web = Starlette(
+    routes=[
+        Route("/", health, methods=["GET", "HEAD"]),
+        Route("/health", health, methods=["GET", "HEAD"]),
+        Route("/telegram", telegram_webhook, methods=["POST"]),
+    ],
+    lifespan=lifespan,
+)
 
 if __name__ == "__main__":
-    main()
+    uvicorn.run(web, host="0.0.0.0", port=PORT)
