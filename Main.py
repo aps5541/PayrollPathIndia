@@ -1,4 +1,5 @@
 import os
+import re
 import asyncio
 import html
 import json
@@ -35,6 +36,11 @@ logger = logging.getLogger("payrollpath")
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
+# Comma-separated Telegram user IDs allowed to run /setwage (set in Replit Secrets)
+ADMIN_IDS = {
+    int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()
+}
+
 DISCLAIMER = (
     "\n\n⚠️ Indicative FY 2026–27 estimate only. Actual payroll depends on "
     "eligible wage components, EPF membership, employer policy, state rules, "
@@ -68,16 +74,55 @@ DAILY_UPDATE_HOUR_IST = int(os.environ.get("DAILY_UPDATE_HOUR_IST", "9"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "bot_data"))
 SUBSCRIBERS_FILE = DATA_DIR / "subscribers.json"
 UPDATES_CACHE_FILE = DATA_DIR / "updates_cache.json"
+MINWAGE_FILE = DATA_DIR / "minimum_wages.json"
 UPDATES_CACHE_TTL_HOURS = 6
-MAX_UPDATE_ITEMS = 15
+MAX_UPDATE_ITEMS = 30
 UPDATE_QUERIES = [
     "labour codes India payroll",
     "Code on Wages rules notification",
     "EPFO circular notification",
     "ESIC notification circular",
     "minimum wages revision notification",
+    "minimum wages hike state government",
+    "VDA revision minimum wages",
     "TDS salary CBDT circular",
     "professional tax labour welfare fund",
+]
+
+STATES = [
+    "Andhra Pradesh",
+    "Arunachal Pradesh",
+    "Assam",
+    "Bihar",
+    "Chhattisgarh",
+    "Goa",
+    "Gujarat",
+    "Haryana",
+    "Himachal Pradesh",
+    "Jharkhand",
+    "Karnataka",
+    "Kerala",
+    "Madhya Pradesh",
+    "Maharashtra",
+    "Manipur",
+    "Meghalaya",
+    "Mizoram",
+    "Nagaland",
+    "Odisha",
+    "Punjab",
+    "Rajasthan",
+    "Sikkim",
+    "Tamil Nadu",
+    "Telangana",
+    "Tripura",
+    "Uttar Pradesh",
+    "Uttarakhand",
+    "West Bengal",
+    "Delhi",
+    "Jammu and Kashmir",
+    "Chandigarh",
+    "Puducherry",
+    "Ladakh",
 ]
 
 # ---------------- MAIN MENU ----------------
@@ -106,17 +151,20 @@ def main_menu_keyboard():
             InlineKeyboardButton("⏰ Overtime", callback_data="calc_ot"),
         ],
         [
+            InlineKeyboardButton("💰 State Min Wages", callback_data="mw_menu"),
             InlineKeyboardButton(
                 "📆 Compliance Calendar", callback_data="info_compliance"
             ),
+        ],
+        [
             InlineKeyboardButton("📰 Updates", callback_data="info_updates"),
-        ],
-        [
             InlineKeyboardButton("💡 Tax Saver", callback_data="info_taxsave"),
-            InlineKeyboardButton("🔔 Daily Alerts", callback_data="info_subscribe"),
         ],
         [
+            InlineKeyboardButton("🔔 Daily Alerts", callback_data="info_subscribe"),
             InlineKeyboardButton("📁 HR Templates", callback_data="info_templates"),
+        ],
+        [
             InlineKeyboardButton("⭐ Premium", callback_data="info_premium"),
         ],
     ]
@@ -140,8 +188,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "ℹ️ *Help*\n\n"
         "Use /start to open the main menu, or type a command directly:\n"
         "/pf /esic /ctc /ctc_new /salary /gratuity /bonus /tds /leave /ot\n"
-        "/regime /taxsave /compliance /updates /templates /premium\n"
-        "/subscribe /unsubscribe (daily compliance alerts)"
+        "/regime /taxsave /compliance /updates /minwage /templates /premium\n"
+        "/subscribe /unsubscribe (daily compliance + minimum wage alerts)"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -257,6 +305,15 @@ async def send_html(message, text, **kwargs):
     return await message.reply_text(text, parse_mode="HTML", **kwargs)
 
 
+def truncate_html(text, limit=4000):
+    """Cut at a line boundary so we never split an HTML tag in half."""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    idx = cut.rfind("\n")
+    return cut[:idx] if idx > 0 else cut
+
+
 async def send_info(key, update, context, via_button):
     message = get_message(update)
     if key == "info_updates":
@@ -278,19 +335,19 @@ async def send_info(key, update, context, via_button):
 
 CALC_PROMPTS = {
     "calc_pf": (
-        "Monthly CTC,Basic+DA*",
-        "bhejo - comma-separated, "
-        "(e.g. `30000,15000`):"
+        "Monthly *gross remuneration, Basic+DA* bhejo — comma-separated, "
+        "without thousands commas (e.g. `30000,15000`):"
     ),
     "calc_esic": (
-        "Monthly *Basic+DA* "
+        "Monthly *gross remuneration, Basic+DA* "
         "bhejo — comma-separated, "
         "without thousands commas (e.g. `30000,15000`):"
     ),
     "calc_ctc": "Apna *Annual CTC* bhejo (sirf number, e.g. 600000):",
     "calc_ctc_new": (
         "New Wage CTC breakup ke liye apna *Annual CTC* bhejo "
-        "(sirf number, e.g. `600000`).\n"),
+        "(sirf number, e.g. `600000`).\n"
+    ),
     "calc_regime": (
         "Format me bhejo: *AnnualGross,OldRegimeDeductions* — deductions me "
         "80C + 80D + NPS + HRA exemption + home loan interest etc. ka total "
@@ -1100,7 +1157,7 @@ async def restart_conversation(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 
-# ---------------- DAILY UPDATES (news feed + subscriptions) ----------------
+# ---------------- JSON STORAGE HELPERS ----------------
 
 
 def load_json(path, default):
@@ -1122,6 +1179,174 @@ def save_json(path, data):
         logger.exception("Could not save %s", path)
 
 
+# ---------------- STATE MINIMUM WAGES ----------------
+
+
+def load_minwages():
+    data = load_json(MINWAGE_FILE, {})
+    if not isinstance(data, dict):
+        data = {}
+    data.setdefault("states", {})
+    data.setdefault("changes", [])
+    return data
+
+
+def minwage_keyboard():
+    rows, row = [], []
+    for i, s in enumerate(STATES):
+        row.append(InlineKeyboardButton(s, callback_data=f"mw_{i}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+
+def format_minwage(state):
+    rec = load_minwages()["states"].get(state)
+    if not rec:
+        return (
+            f"💰 <b>{html.escape(state)}</b>\n"
+            "Is state ka verified data abhi add nahi hua. Official labour "
+            "department notification check karo."
+        )
+    r = rec["rates"]
+    text = (
+        f"💰 <b>Minimum Wages — {html.escape(state)}</b>\n"
+        f"Effective from: {html.escape(rec['effective'])}\n\n"
+        f"Unskilled: ₹{r[0]:,.0f}/month\n"
+        f"Semi-skilled: ₹{r[1]:,.0f}/month\n"
+        f"Skilled: ₹{r[2]:,.0f}/month\n"
+        f"Highly skilled: ₹{r[3]:,.0f}/month\n"
+    )
+    if rec.get("source"):
+        text += (
+            f'\n<a href="{html.escape(rec["source"], quote=True)}">'
+            "Official source</a>\n"
+        )
+    text += (
+        f"\n<i>Last verified: {html.escape(rec.get('verified', 'n/a'))}. "
+        "Zone/area-wise rates, industry (scheduled employment) aur VDA alag ho "
+        "sakte hain — notification se confirm karo.</i>"
+    )
+    return text
+
+
+async def minwage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await get_message(update).reply_text(
+        "💰 State chuno (minimum wages):", reply_markup=minwage_keyboard()
+    )
+
+
+async def minwage_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "mw_menu":
+        await query.message.reply_text(
+            "💰 State chuno (minimum wages):", reply_markup=minwage_keyboard()
+        )
+        return
+    try:
+        state = STATES[int(query.data.removeprefix("mw_"))]
+    except (ValueError, IndexError):
+        return
+    await send_html(query.message, format_minwage(state))
+
+
+async def setwage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin only. Usage:
+    /setwage Haryana | 2026-10-01 | 13000,14000,15500,17000 | https://source
+    (rates = unskilled, semi-skilled, skilled, highly skilled; per month;
+    source URL is optional)"""
+    user = update.effective_user
+    if not user or user.id not in ADMIN_IDS:
+        await update.message.reply_text("Not authorised.")
+        return
+    try:
+        raw = update.message.text.split(maxsplit=1)[1]
+        parts = [p.strip() for p in raw.split("|")]
+        state = next(s for s in STATES if s.lower() == parts[0].lower())
+        effective = datetime.strptime(parts[1], "%Y-%m-%d").date().isoformat()
+        rates = [float(x) for x in parts[2].replace("₹", "").split(",")]
+        if len(rates) != 4 or any(not math.isfinite(r) or r <= 0 for r in rates):
+            raise ValueError
+        source = parts[3] if len(parts) > 3 else ""
+    except (IndexError, StopIteration, ValueError):
+        await update.message.reply_text(
+            "Format:\n/setwage State | YYYY-MM-DD | "
+            "unskilled,semi,skilled,highly | source_url(optional)"
+        )
+        return
+
+    data = load_minwages()
+    old = data["states"].get(state)
+    today = datetime.now(IST).date().isoformat()
+    data["states"][state] = {
+        "effective": effective,
+        "rates": rates,
+        "source": source,
+        "verified": today,
+    }
+    changed = (not old) or old["rates"] != rates
+    if changed:
+        data["changes"].append(
+            {
+                "id": f"{state}|{effective}|{today}",
+                "state": state,
+                "effective": effective,
+                "old": old["rates"] if old else None,
+                "new": rates,
+                "announced": today,
+            }
+        )
+        data["changes"] = data["changes"][-100:]
+    save_json(MINWAGE_FILE, data)
+    await update.message.reply_text(
+        f"✅ {state} minimum wages saved."
+        + (" Next daily alert me jayega." if changed else " (Rates same the, sirf verified date update hui.)")
+    )
+
+
+async def mwstatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin only: which states have data and which are still missing."""
+    user = update.effective_user
+    if not user or user.id not in ADMIN_IDS:
+        await update.message.reply_text("Not authorised.")
+        return
+    data = load_minwages()["states"]
+    have = [s for s in STATES if s in data]
+    missing = [s for s in STATES if s not in data]
+    lines = [f"Data added: {len(have)}/{len(STATES)}"]
+    for s in have:
+        lines.append(f"✅ {s} — effective {data[s]['effective']}, verified {data[s].get('verified', 'n/a')}")
+    if missing:
+        lines.append("\nPending: " + ", ".join(missing))
+    await update.message.reply_text("\n".join(lines)[:4000])
+
+
+def tag_minwage_news(items):
+    """Headlines about minimum wage / VDA, with any state names found in the title."""
+    out = []
+    for it in items:
+        t = it["title"].lower()
+        if (
+            "minimum wage" in t
+            or re.search(r"\bvda\b", t)
+            or "dearness allowance" in t
+        ):
+            states = [
+                s
+                for s in STATES
+                if re.search(rf"\b{re.escape(s.lower())}\b", t)
+            ]
+            out.append((it, states))
+    return out
+
+
+# ---------------- DAILY UPDATES (news feed + subscriptions) ----------------
+
+
 def get_subscribers():
     return set(load_json(SUBSCRIBERS_FILE, []))
 
@@ -1131,7 +1356,9 @@ def subscribe_keyboard(chat_id):
     label = (
         "🔕 Daily alerts band karo" if subscribed else "🔔 Daily alerts chalu karo"
     )
-    return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data="info_subscribe")]])
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(label, callback_data="info_subscribe")]]
+    )
 
 
 async def toggle_subscription(update, context, force=None):
@@ -1143,8 +1370,8 @@ async def toggle_subscription(update, context, force=None):
         subs.add(chat_id)
         text = (
             f"🔔 Daily alerts *ON*. Roz subah {DAILY_UPDATE_HOUR_IST}:00 IST par "
-            "labour code/compliance headlines aur upcoming due dates milenge. "
-            "Band karne ke liye /unsubscribe."
+            "labour code/compliance headlines, state minimum wage changes aur "
+            "upcoming due dates milenge. Band karne ke liye /unsubscribe."
         )
     else:
         subs.discard(chat_id)
@@ -1242,6 +1469,30 @@ def format_news_items(items, limit=8):
     return "\n".join(lines)
 
 
+def format_minwage_alerts(changes, news):
+    """HTML block for verified (admin) changes + auto-detected headlines."""
+    lines = ["<b>💰 Minimum Wage Alerts</b>"]
+    for c in changes:
+        n = c["new"]
+        lines.append(
+            f"• <b>{html.escape(c['state'])}</b> — revised, effective "
+            f"{html.escape(c['effective'])}: Unskilled ₹{n[0]:,.0f}, "
+            f"Semi ₹{n[1]:,.0f}, Skilled ₹{n[2]:,.0f}, Highly ₹{n[3]:,.0f}"
+        )
+    for it, states in news:
+        tag = f" [{html.escape(', '.join(states))}]" if states else ""
+        day = datetime.fromisoformat(it["published"]).astimezone(IST).strftime("%d %b")
+        lines.append(
+            f'• <a href="{html.escape(it["link"], quote=True)}">'
+            f'{html.escape(it["title"])}</a>{tag} — {day}'
+        )
+    lines.append(
+        "<i>Headlines auto-fetch hoti hain; rates /minwage me verify hone ke baad "
+        "update hote hain.</i>"
+    )
+    return "\n".join(lines)
+
+
 def upcoming_deadlines(today=None, window_days=10):
     """Recurring due dates falling in the next `window_days` days."""
     today = today or datetime.now(IST).date()
@@ -1273,10 +1524,19 @@ async def build_updates_message():
     )
     due = upcoming_deadlines()
     if due:
-        text += "<b>⏳ Upcoming due dates</b>\n" + "\n".join(
-            "• " + html.escape(d) for d in due
-        ) + "\n\n"
+        text += (
+            "<b>⏳ Upcoming due dates</b>\n"
+            + "\n".join("• " + html.escape(d) for d in due)
+            + "\n\n"
+        )
     if items:
+        mw_news = tag_minwage_news(items)[:4]
+        if mw_news:
+            text += (
+                "<b>💰 Minimum wage headlines</b> (state rates ke liye /minwage)\n"
+                + format_news_items([it for it, _ in mw_news], limit=4)
+                + "\n\n"
+            )
         fetched = datetime.fromisoformat(cache["fetched_at"]).astimezone(IST)
         text += (
             f"<b>🗞 Latest headlines</b> (updated {fetched.strftime('%d %b, %H:%M')} IST)\n"
@@ -1290,7 +1550,7 @@ async def build_updates_message():
         "<b>Official sources:</b> labour.gov.in • epfindia.gov.in • esic.gov.in • "
         "incometax.gov.in\n" + html.escape(DISCLAIMER.strip())
     )
-    return text[:4000]
+    return truncate_html(text)
 
 
 async def broadcast_daily(app):
@@ -1308,19 +1568,29 @@ async def broadcast_daily(app):
         and datetime.fromisoformat(i["published"]) >= cutoff
     ]
 
+    # Minimum wage: verified changes not yet broadcast + new tagged headlines
+    mw_data = load_minwages()
+    mw_sent = set(cache.get("mw_sent", []))
+    new_mw_changes = [c for c in mw_data["changes"] if c["id"] not in mw_sent]
+    mw_news = tag_minwage_news(new_items)
+
     today = datetime.now(IST)
     text = f"🔔 <b>Daily Payroll &amp; Compliance Update — {today.strftime('%d %b %Y')}</b>\n\n"
     due = upcoming_deadlines(today.date())
     if due:
-        text += "<b>⏳ Upcoming due dates</b>\n" + "\n".join(
-            "• " + html.escape(d) for d in due
-        ) + "\n\n"
+        text += (
+            "<b>⏳ Upcoming due dates</b>\n"
+            + "\n".join("• " + html.escape(d) for d in due)
+            + "\n\n"
+        )
+    if new_mw_changes or mw_news:
+        text += format_minwage_alerts(new_mw_changes, mw_news) + "\n\n"
     if new_items:
         text += "<b>🗞 Naye headlines</b>\n" + format_news_items(new_items) + "\n\n"
     else:
         text += "Aaj labour code/compliance ke koi naye headlines nahi mile.\n\n"
-    text += "<i>Official notification se verify karo. /updates se poori list dekho.</i>"
-    text = text[:4000]
+    text += "<i>Official notification se verify karo. /updates se poori list dekho, /minwage se state rates.</i>"
+    text = truncate_html(text)
 
     for chat_id in list(subs):
         try:
@@ -1338,6 +1608,7 @@ async def broadcast_daily(app):
 
     save_json(SUBSCRIBERS_FILE, sorted(subs))
     cache["broadcast_ids"] = [i["link"] for i in items]
+    cache["mw_sent"] = [c["id"] for c in mw_data["changes"]]
     save_json(UPDATES_CACHE_FILE, cache)
 
 
@@ -1420,7 +1691,7 @@ async def route(key, update, context, via_button):
 
 # Direct command versions (e.g. /pf) also open the same calculator flow
 async def direct_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cmd = update.message.text.split()[0][1:]  # strip "/"
+    cmd = update.message.text.split()[0][1:].split("@")[0]  # strip "/" and @botname
     key = f"calc_{cmd}"
     if key in CALC_PROMPTS:
         return await calc_entry(key, update, context, via_button=False)
@@ -1499,6 +1770,11 @@ def main():
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("subscribe", subscribe_cmd))
     app.add_handler(CommandHandler("unsubscribe", unsubscribe_cmd))
+    # Minimum wages
+    app.add_handler(CallbackQueryHandler(minwage_callback, pattern="^mw_"))
+    app.add_handler(CommandHandler("minwage", minwage_cmd))
+    app.add_handler(CommandHandler("setwage", setwage_cmd))
+    app.add_handler(CommandHandler("mwstatus", mwstatus_cmd))
     for c in info_commands:
         app.add_handler(CommandHandler(c, direct_command))
     app.add_handler(
