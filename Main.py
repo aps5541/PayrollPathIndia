@@ -1,1879 +1,620 @@
-import os
-import re
-import asyncio
-import html
-import json
-import logging
-import math
+"""PayrollPath India - compact Telegram bot.
+Every calculator replies with a table IMAGE + an EXCEL file (live formulas, Excel Table)."""
+import asyncio, html, json, logging, math, os, re
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+from io import BytesIO
 from pathlib import Path
 from urllib.parse import quote_plus
 
 import httpx
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import Forbidden, BadRequest
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ConversationHandler,
-    ContextTypes,
-    TypeHandler,
-    filters,
-)
-
-try:  # python-telegram-bot >= 21
-    from telegram import LinkPreviewOptions
-except ImportError:  # older versions
-    LinkPreviewOptions = None
+from matplotlib.figure import Figure
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.worksheet.table import Table, TableStyleInfo
+from telegram import InlineKeyboardButton as Btn, InlineKeyboardMarkup as Kb, LinkPreviewOptions, Update
+from telegram.error import BadRequest, Forbidden
+from telegram.ext import (ApplicationBuilder, CallbackQueryHandler, CommandHandler,
+                          ContextTypes, MessageHandler, TypeHandler, filters)
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
-logger = logging.getLogger("payrollpath")
+log = logging.getLogger("payrollpath")
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-
-# Comma-separated Telegram user IDs allowed to run /setwage (set in Replit Secrets)
-ADMIN_IDS = {
-    int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()
-}
-
-DISCLAIMER = (
-    "\n\n⚠️ Indicative FY 2026–27 estimate only. Actual payroll depends on "
-    "eligible wage components, EPF membership, employer policy, state rules, "
-    "tax declarations and current notifications. Verify before payroll use."
-)
-
-# Conversation states
-AMOUNT = 1
-TAX_REGIME = 2
-OLD_DEDUCTIONS = 3
-OLD_AGE = 4
-
-EPF_WAGE_CEILING = 25000
-ESIC_WAGE_CEILING = 21000
-
-# New-wage CTC components (employer side)
-EPF_ADMIN_RATE = 0.005  # EPF admin charges
-EDLI_RATE = 0.005  # EDLI contribution
-GRATUITY_MONTHLY_FACTOR = 15 / 26 / 12  # 15 days wages per year, accrued monthly
-BONUS_RATE_MIN = 0.0833  # statutory minimum bonus
-BONUS_ELIGIBILITY_WAGE = 21000
-
-# Support hours (IST). Outside this window users get a "late reply" notice.
+ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 IST = timezone(timedelta(hours=5, minutes=30))
-OFFICE_START_HOUR = int(os.environ.get("OFFICE_START_HOUR", "10"))  # 10:00 AM
-OFFICE_END_HOUR = int(os.environ.get("OFFICE_END_HOUR", "18"))  # 06:00 PM
-AFTER_HOURS_NOTICE_GAP_HOURS = 6  # don't repeat the notice more often than this
+OPEN_H, CLOSE_H = int(os.environ.get("OFFICE_START_HOUR", 10)), int(os.environ.get("OFFICE_END_HOUR", 18))
+DAILY_H = int(os.environ.get("DAILY_UPDATE_HOUR_IST", 9))
+DATA = Path(os.environ.get("DATA_DIR", "bot_data"))
+SUBS, CACHE, MW = DATA / "subscribers.json", DATA / "updates_cache.json", DATA / "minimum_wages.json"
+NOPREV = LinkPreviewOptions(is_disabled=True)
+NOTE = ("⚠️ Indicative FY 2026–27 estimate only. Actual payroll depends on wage components, EPF "
+        "membership, employer policy, state rules, tax declarations & current notifications. Verify before payroll use.")
+QUERIES = ["labour codes India payroll", "Code on Wages rules notification", "EPFO circular notification",
+           "ESIC notification circular", "minimum wages revision notification", "minimum wages hike state government",
+           "VDA revision minimum wages", "TDS salary CBDT circular", "professional tax labour welfare fund"]
+STATES = ("Andhra Pradesh,Arunachal Pradesh,Assam,Bihar,Chhattisgarh,Goa,Gujarat,Haryana,Himachal Pradesh,"
+          "Jharkhand,Karnataka,Kerala,Madhya Pradesh,Maharashtra,Manipur,Meghalaya,Mizoram,Nagaland,Odisha,"
+          "Punjab,Rajasthan,Sikkim,Tamil Nadu,Telangana,Tripura,Uttar Pradesh,Uttarakhand,West Bengal,Delhi,"
+          "Jammu and Kashmir,Chandigarh,Puducherry,Ladakh").split(",")
 
-# Daily updates
-DAILY_UPDATE_HOUR_IST = int(os.environ.get("DAILY_UPDATE_HOUR_IST", "9"))
-DATA_DIR = Path(os.environ.get("DATA_DIR", "bot_data"))
-SUBSCRIBERS_FILE = DATA_DIR / "subscribers.json"
-UPDATES_CACHE_FILE = DATA_DIR / "updates_cache.json"
-MINWAGE_FILE = DATA_DIR / "minimum_wages.json"
-UPDATES_CACHE_TTL_HOURS = 6
-MAX_UPDATE_ITEMS = 30
-UPDATE_QUERIES = [
-    "labour codes India payroll",
-    "Code on Wages rules notification",
-    "EPFO circular notification",
-    "ESIC notification circular",
-    "minimum wages revision notification",
-    "minimum wages hike state government",
-    "VDA revision minimum wages",
-    "TDS salary CBDT circular",
-    "professional tax labour welfare fund",
-]
-
-STATES = [
-    "Andhra Pradesh",
-    "Arunachal Pradesh",
-    "Assam",
-    "Bihar",
-    "Chhattisgarh",
-    "Goa",
-    "Gujarat",
-    "Haryana",
-    "Himachal Pradesh",
-    "Jharkhand",
-    "Karnataka",
-    "Kerala",
-    "Madhya Pradesh",
-    "Maharashtra",
-    "Manipur",
-    "Meghalaya",
-    "Mizoram",
-    "Nagaland",
-    "Odisha",
-    "Punjab",
-    "Rajasthan",
-    "Sikkim",
-    "Tamil Nadu",
-    "Telangana",
-    "Tripura",
-    "Uttar Pradesh",
-    "Uttarakhand",
-    "West Bengal",
-    "Delhi",
-    "Jammu and Kashmir",
-    "Chandigarh",
-    "Puducherry",
-    "Ladakh",
-]
-
-# ---------------- MAIN MENU ----------------
+# ======================= CALCULATION ENGINE =======================
+# One formula string drives BOTH the python value and the Excel formula.
+# {name} = another row/input. Use only: + - * / <= >= < > MIN MAX IF ROUND CEILING.
+R = lambda x, n=0: math.floor(x * 10 ** n + 0.5) / 10 ** n
+FUNCS = {"__builtins__": {}, "MIN": min, "MAX": max, "ROUND": R,
+         "IF": lambda c, a, b: a if c else b, "CEILING": lambda x, s: math.ceil(x / s) * s}
+REF = re.compile(r"\{(\w+)\}")
 
 
-def main_menu_keyboard():
-    buttons = [
-        [
-            InlineKeyboardButton("🏦 PF Calculator", callback_data="calc_pf"),
-            InlineKeyboardButton("🏥 ESIC Calculator", callback_data="calc_esic"),
-        ],
-        [
-            InlineKeyboardButton("📊 CTC Breakup", callback_data="calc_ctc"),
-            InlineKeyboardButton("🆕 New Wage CTC", callback_data="calc_ctc_new"),
-        ],
-        [
-            InlineKeyboardButton("💵 Net Salary", callback_data="calc_salary"),
-            InlineKeyboardButton("🎁 Gratuity", callback_data="calc_gratuity"),
-        ],
-        [
-            InlineKeyboardButton("🎯 Bonus", callback_data="calc_bonus"),
-            InlineKeyboardButton("🏖 Leave Encashment", callback_data="calc_leave"),
-        ],
-        [
-            InlineKeyboardButton("🧾 TDS (old/new)", callback_data="calc_tds"),
-            InlineKeyboardButton("⏰ Overtime", callback_data="calc_ot"),
-        ],
-        [
-            InlineKeyboardButton("💰 State Min Wages", callback_data="mw_menu"),
-            InlineKeyboardButton(
-                "📆 Compliance Calendar", callback_data="info_compliance"
-            ),
-        ],
-        [
-            InlineKeyboardButton("📰 Updates", callback_data="info_updates"),
-            InlineKeyboardButton("💡 Tax Saver", callback_data="info_taxsave"),
-        ],
-        [
-            InlineKeyboardButton("🔔 Daily Alerts", callback_data="info_subscribe"),
-            InlineKeyboardButton("📁 HR Templates", callback_data="info_templates"),
-        ],
-        [
-            InlineKeyboardButton("⭐ Premium", callback_data="info_premium"),
-        ],
-    ]
-    return InlineKeyboardMarkup(buttons)
+def run(spec, inp):
+    v = dict(inp)
+    for n, _, f, _ in spec["rows"]:
+        if f:
+            v[n] = eval(REF.sub(r"V['\1']", f), FUNCS, {"V": v})
+    return v
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    clear_calc_state(context)
-    text = (
-        "👋 *Welcome to PayrollPath India!*\n\n"
-        "Your free HR & payroll compliance assistant.\n"
-        "Choose a calculator or info option below:"
-    )
-    await update.message.reply_text(
-        text, parse_mode="Markdown", reply_markup=main_menu_keyboard()
-    )
+def taxrows(p, gx, new):
+    """Income-tax rows (slab, rebate, surcharge, cess) for one regime; gx = annual gross formula."""
+    t = "{%sti}" % p
+    bands = ([(4e5, 8e5, .05), (8e5, 12e5, .1), (12e5, 16e5, .15), (16e5, 20e5, .2), (20e5, 24e5, .25), (24e5, 1e12, .3)]
+             if new else [("{%sex}" % p, 5e5, .05), (5e5, 10e5, .2), (10e5, 1e12, .3)])
+    fmt = lambda x: x if isinstance(x, str) else int(x)
+    slab = "+".join(f"MAX(0,MIN({t},{fmt(h)})-{fmt(l)})*{r}" for l, h, r in bands)
+    sl = "{%ssl}" % p
+    reb = (f"IF({t}<=1200000,MAX(0,{sl}-60000),MIN({sl},{t}-1200000))" if new
+           else f"IF({t}<=500000,MAX(0,{sl}-12500),{sl})")
+    sr = f"IF({t}>20000000,0.25,IF({t}>10000000,0.15,IF({t}>5000000,0.1,0)))"
+    if not new:
+        sr = f"IF({t}>50000000,0.37,{sr})"
+    L = "New: " if new else "Old: "
+    rows = [(p + "ti", L + "Taxable income", f"MAX(0,{gx}-{75000 if new else 50000}" + ("" if new else "-{ded}") + ")",
+             "After std deduction" + ("" if new else " + deductions")),
+            (p + "sl", L + "Slab tax", slab, ""),
+            (p + "rb", L + "Tax after rebate", reb, "Sec 87A rebate / marginal relief"),
+            (p + "sr", L + "Surcharge rate", sr, ""),
+            (p + "tax", L + "Annual tax (+4% cess)", "{%srb}*(1+{%ssr})*1.04" % (p, p), "No surcharge marginal relief"),
+            (p + "mt", L + "Monthly TDS", "{%stax}/12" % p, "Average per month")]
+    if not new:
+        rows.insert(0, (p + "ex", L + "Basic exemption limit", "IF({age}<=0,250000,IF({age}<=1,300000,500000))", "By age band"))
+    return rows
 
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "ℹ️ *Help*\n\n"
-        "Use /start to open the main menu, or type a command directly:\n"
-        "/pf /esic /ctc /ctc_new /salary /gratuity /bonus /tds /leave /ot\n"
-        "/regime /taxsave /compliance /updates /minwage /templates /premium\n"
-        "/subscribe /unsubscribe (daily compliance + minimum wage alerts)"
-    )
-    await update.message.reply_text(text, parse_mode="Markdown")
+GB = [("gross", "Monthly gross remuneration", None), ("basic", "Basic+DA", None)]
+TAXIN = [("ded", "Old-regime deductions (annual)", 0), ("age", "Age band (0=<60, 1=60-79, 2=80+)", 0)]
+WB = [("wb", "Wage base (50% rule)", "MAX({basic},{gross}*0.5)", "Basic+DA, min 50% of gross"),
+      ("pfw", "PF wage (25,000 ceiling)", "MIN({wb},25000)", "")]
+ESIC_OK = ("ok", "ESIC eligible? (1=yes)", "IF({wb}<=21000,1,0)", "Wage base <= 21,000")
+SEC = lambda t: (None, "— " + t + " —", None, "")
 
-
-async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    return await route(query.data, update, context, via_button=True)
-
-
-# ---------------- INFO SECTIONS ----------------
-
-INFO_TEXT = {
-    "info_compliance": (
-        "📆 *Compliance Calendar — HR Teams*\n\n"
-        "*🗓 Monthly*\n"
-        "- 7th: Salary Processing\n"
-        "- 7th: Pay Slip\n"
-        "- 7th: TDS (24Q) deposit\n"
-        "- 15th: EPF payment\n"
-        "- 15th: ESIC payment\n"
-        "- Professional Tax: varies by state\n"
-        "- LWF: varies by state\n\n"
-        "*📅 Annual Returns / Renewals*\n"
-        "- Bonus Act: within 8 months of FY-end\n"
-        "- Shop & Establishment Act: annual renewal, as per mentioned date\n"
-        "- POSH: annual return\n"
-        "- Child Labour Act: annual return\n"
-        "- Gratuity Act: annual return\n"
-        "- Maternity Benefit Act: annual return\n"
-        "- Equal Remuneration Act: annual return\n"
-        "- CLRA Act: annual return\n\n"
-        "*📚 Auditable Registers (monthly update)*\n"
-        "- Muster Roll\n"
-        "- Wages Register\n"
-        "- Overtime Register\n"
-        "- Accident Register\n"
-        "- Deduction, Fine & Advance Register\n"
-        "- Leave Register\n"
-        "- Employee Master / Workmen Register\n\n"
-        "*📌 Also remember*\n"
-        "- TDS 24Q return filing is quarterly: 31 Jul, 31 Oct, 31 Jan, 31 May\n"
-        "- Form 16 to employees: by 15 June\n"
-        "- GST returns (finance team): 20th/22nd/24th depending on turnover/state\n\n"
-        "_State-specific dates (PT, LWF, S&E, annual returns) differ — confirm on "
-        "your state labour department portal._" + DISCLAIMER
-    ),
-    "info_updates": "Loading updates...",  # built dynamically, see build_updates_message()
-    "info_taxsave": (
-        "💡 *Tax Saver — employee ka TDS legally kaise kam karein*\n\n"
-        "*1️⃣ Pehle sahi regime chuno*\n"
-        "- New regime (default): ₹75,000 standard deduction, taxable income "
-        "₹12L tak rebate (salary ~₹12.75L tak zero tax)\n"
-        "- Old regime tab jeetta hai jab HRA, home loan, 80C, 80D jaise "
-        "deductions kaafi ho. Niche button se compare karo.\n\n"
-        "*2️⃣ Dono regime me kaam aata hai*\n"
-        "- Employer NPS contribution (80CCD(2)): Basic+DA ka 14% tak "
-        "(new regime me bhi) — salary structure me add karwao\n"
-        "- Employer PF + NPS + superannuation: ₹7.5L/yr tak tax-free\n\n"
-        "*3️⃣ Sirf Old regime me*\n"
-        "- 80C: ₹1.5L (PPF, ELSS, LIC, tuition fee, home loan principal, "
-        "employee PF)\n"
-        "- NPS extra (80CCD(1B)): ₹50,000\n"
-        "- 80D health insurance: ₹25,000 self/family (senior ₹50,000) + "
-        "parents ₹25,000/₹50,000\n"
-        "- HRA exemption: rent receipts; metro 50% / non-metro 40% of Basic+DA; "
-        "rent > ₹1L/yr par landlord PAN\n"
-        "- Home loan interest ₹2L (self-occupied), education loan interest "
-        "(80E), donations (80G), savings interest ₹10,000 (80TTA), LTA\n\n"
-        "*4️⃣ Payroll team ke liye checklist*\n"
-        "- April me regime + investment declaration lo, Dec–Jan me proofs\n"
-        "- Pichhle employer ki salary/TDS details (Form 12B) lo, warna TDS "
-        "kam katega aur March me shock lagega\n"
-        "- Proof late aaye to tax hold na kare — time pe correction run karo\n"
-        "- Zyada TDS kat gaya ho to ITR me refund claim hota hai\n"
-        "- Income-tax Act 2025 me section numbers badle hain (80C → 123, "
-        "80D → 126, NPS → 124); limits lagbhag same. Form 16 me naye numbers "
-        "dikhenge.\n" + DISCLAIMER
-    ),
-    "info_templates": (
-        "📁 *HR Templates*\n\n"
-        "Coming soon: offer letters, appointment letters, payslip "
-        "formats, FnF settlement templates. (This section is still "
-        "being built.)"
-    ),
-    "info_premium": (
-        "⭐ *Premium Tools*\n\n"
-        "Planned premium features: bulk payroll reports, state-wise "
-        "compliance tracker, auto-generated payslips. Payment system "
-        "coming in a later update."
-    ),
+SPECS = {
+    "pf": dict(title="PF Calculation", ex="30000,15000", inputs=GB, chk=lambda v: v["basic"] <= v["gross"],
+               rows=WB + [("ee", "Employee PF 12%", "ROUND({pfw}*0.12,0)", ""),
+                          ("er", "Employer total 12%", "ROUND({pfw}*0.12,0)", ""),
+                          ("eps", "Employer EPS 8.33%", "ROUND({pfw}*0.0833,0)", ""),
+                          ("epf", "Employer EPF balance", "{er}-{eps}", "")], res=["ee", "er"]),
+    "esic": dict(title="ESIC Calculation", ex="18000,9000", inputs=GB, chk=lambda v: v["basic"] <= v["gross"],
+                 rows=WB[:1] + [ESIC_OK, ("ee", "Employee 0.75%", "ROUND({wb}*0.0075,0)*{ok}", ""),
+                                ("er", "Employer 3.25%", "ROUND({wb}*0.0325,0)*{ok}", ""),
+                                ("tot", "Total contribution", "{ee}+{er}", "")], res=["ee", "er"]),
+    "ctc": dict(title="Standard CTC Breakup", ex="600000", inputs=[("ctc", "Annual CTC", None)],
+                rows=[("m", "Monthly CTC", "{ctc}/12", ""), ("basic", "Basic+DA (40%)", "{m}*0.4", "Illustrative"),
+                      ("hra", "HRA (50% of Basic)", "{basic}*0.5", ""),
+                      ("pf", "Employer PF 12%", "ROUND(MIN({basic},25000)*0.12,0)", ""),
+                      ("oth", "Other allowances (balance)", "{m}-{basic}-{hra}-{pf}", "")], res=["basic", "hra", "oth"]),
+    "ctc_new": dict(title="New Wage CTC Breakup", ex="600000  or  600000,12000", solve=True,
+                    inputs=[("ctc", "Annual CTC", None), ("ins", "Annual insurance/benefits", 0), ("gross", "Monthly gross (auto-solved)", 0)],
+                    chk=lambda v: v["ctc"] >= 50000 and v["ins"] < v["ctc"] * .5,
+                    rows=[SEC("Earnings (monthly)"), ("basic", "Basic+DA (>=50%)", "CEILING({gross}/2,1)", ""),
+                          ("hra", "HRA (50% of Basic)", "ROUND({basic}*0.5,0)", "Illustrative"),
+                          ("spl", "Special allowance", "{gross}-{basic}-{hra}", ""),
+                          SEC("Employer cost (monthly)")] + WB[:1] + [WB[1],
+                          ("er", "Employer EPF 12%", "ROUND({pfw}*0.12,0)", "EPS 8.33% + EPF"),
+                          ("adm", "EPF admin + EDLI 1%", "ROUND({pfw}*0.01,0)", ""), ESIC_OK,
+                          ("eer", "Employer ESIC 3.25%", "ROUND({wb}*0.0325,0)*{ok}", ""),
+                          ("grat", "Gratuity provision", "ROUND({basic}*15/26/12,0)", "4.81% of Basic"),
+                          ("bon", "Bonus provision 8.33%", "IF({basic}<=21000,ROUND({basic}*0.0833,0),0)", "Statutory minimum"),
+                          ("insm", "Insurance/benefits", "{ins}/12", ""),
+                          ("total", "Total monthly cost (<= CTC/12)", "{gross}+{er}+{adm}+{eer}+{grat}+{bon}+{insm}", "Gross + employer side"),
+                          ("tgt", "Monthly CTC", "{ctc}/12", ""),
+                          SEC("Employee side (monthly)"), ("eee", "Employee PF 12%", "ROUND({pfw}*0.12,0)", ""),
+                          ("ees", "Employee ESIC 0.75%", "ROUND({wb}*0.0075,0)*{ok}", ""),
+                          ("net", "Net before TDS/PT", "{gross}-{eee}-{ees}", "PT/LWF state-specific")]
+                    + taxrows("n_", "{gross}*12", True) + [("inh", "In-hand after TDS", "{net}-{n_mt}", "")],
+                    res=["gross", "net", "inh"]),
+    "tds": dict(title="TDS: Old vs New Regime", ex="900000  or  900000,150000,0",
+                inputs=[("gross", "Annual gross salary", None)] + TAXIN,
+                rows=[SEC("New regime")] + taxrows("n_", "{gross}", True) + [SEC("Old regime")] + taxrows("o_", "{gross}", False)
+                     + [("save", "Saving with New (- = Old better)", "{o_tax}-{n_tax}", "")],
+                res=["n_mt", "o_mt", "save"]),
+    "salary": dict(title="Net Salary Estimate", ex="30000,15000  or  60000,30000,150000,0", inputs=GB + TAXIN,
+                   chk=lambda v: v["basic"] <= v["gross"],
+                   rows=WB + [("epf", "Employee PF 12%", "ROUND({pfw}*0.12,0)", ""), ESIC_OK,
+                              ("esic", "Employee ESIC 0.75%", "ROUND({wb}*0.0075,0)*{ok}", "")]
+                        + [SEC("New regime")] + taxrows("n_", "{gross}*12", True)
+                        + [SEC("Old regime")] + taxrows("o_", "{gross}*12", False)
+                        + [SEC("Net pay"), ("net_n", "Net pay - New regime", "{gross}-{epf}-{esic}-{n_mt}", "PT not included"),
+                           ("net_o", "Net pay - Old regime", "{gross}-{epf}-{esic}-{o_mt}", "PT not included")],
+                   res=["net_n", "net_o"]),
+    "gratuity": dict(title="Gratuity", ex="20000,6", inputs=[("basic", "Last drawn Basic+DA", None), ("years", "Years of service", None)],
+                     rows=[("ok", "Eligible? (1=yes, >=5 years)", "IF({years}>=5,1,0)", "Fixed-term rules may differ"),
+                           ("amt", "Gratuity amount", "{basic}*15*{years}/26*{ok}", "Basic x 15 x Years / 26")], res=["amt"]),
+    "bonus": dict(title="Statutory Bonus", ex="15000", inputs=[("wage", "Monthly wage", None)],
+                  rows=[("ok", "Eligible? (1=yes, wage <= 21,000)", "IF({wage}<=21000,1,0)", ""),
+                        ("mn", "Minimum bonus 8.33% (annual)", "{wage}*12*0.0833*{ok}", ""),
+                        ("mx", "Maximum bonus 20% (annual)", "{wage}*12*0.2*{ok}", "")], res=["mn", "mx"]),
+    "leave": dict(title="Leave Encashment", ex="24000,15", inputs=[("basic", "Monthly Basic+DA", None), ("days", "EL days", None)],
+                  rows=[("pd", "Per day rate", "{basic}/30", "30-day divisor; follow company policy"),
+                        ("amt", "Encashment amount", "{pd}*{days}", "")], res=["amt"]),
+    "ot": dict(title="Overtime Pay", ex="150,10", inputs=[("rate", "Hourly rate", None), ("hrs", "Overtime hours", None)],
+               rows=[("amt", "Overtime pay (2x rate)", "{rate}*2*{hrs}", "")], res=["amt"]),
 }
 
 
-INFO_KEYBOARDS = {
-    "info_taxsave": InlineKeyboardMarkup(
-        [[InlineKeyboardButton("🧮 Compare Old vs New", callback_data="calc_regime")]]
-    ),
-}
-
-
-def get_message(update):
-    if update.callback_query:
-        return update.callback_query.message
-    return update.message
-
-
-async def send_html(message, text, **kwargs):
-    if LinkPreviewOptions is not None:
-        kwargs["link_preview_options"] = LinkPreviewOptions(is_disabled=True)
-    else:
-        kwargs["disable_web_page_preview"] = True
-    return await message.reply_text(text, parse_mode="HTML", **kwargs)
-
-
-def truncate_html(text, limit=4000):
-    """Cut at a line boundary so we never split an HTML tag in half."""
-    if len(text) <= limit:
-        return text
-    cut = text[:limit]
-    idx = cut.rfind("\n")
-    return cut[:idx] if idx > 0 else cut
-
-
-async def send_info(key, update, context, via_button):
-    message = get_message(update)
-    if key == "info_updates":
-        text = await build_updates_message()
-        await send_html(
-            message,
-            text,
-            reply_markup=subscribe_keyboard(update.effective_chat.id),
-        )
-        return
-    await message.reply_text(
-        INFO_TEXT[key],
-        parse_mode="Markdown",
-        reply_markup=INFO_KEYBOARDS.get(key),
-    )
-
-
-# ---------------- CALCULATORS (conversation-based) ----------------
-
-CALC_PROMPTS = {
-    "calc_pf": (
-        "Monthly *gross remuneration, Basic+DA* bhejo — comma-separated, "
-        "without thousands commas (e.g. `30000,15000`):"
-    ),
-    "calc_esic": (
-        "Monthly *gross remuneration, Basic+DA* "
-        "bhejo — comma-separated, "
-        "without thousands commas (e.g. `30000,15000`):"
-    ),
-    "calc_ctc": "Apna *Annual CTC* bhejo (sirf number, e.g. 600000):",
-    "calc_ctc_new": (
-        "New Wage CTC breakup ke liye apna *Annual CTC* bhejo "
-        "(sirf number, e.g. `600000`).\n"
-    ),
-    "calc_regime": (
-        "Format me bhejo: *AnnualGross,OldRegimeDeductions* — deductions me "
-        "80C + 80D + NPS + HRA exemption + home loan interest etc. ka total "
-        "(e.g. `1200000,350000`). Deductions nahi ho to `1200000,0`:"
-    ),
-    "calc_salary": (
-        "Monthly *gross salary, Basic+DA* "
-        "bhejo — comma-separated, "
-        "without thousands commas (e.g. `30000,15000`):"
-    ),
-    "calc_gratuity": "Format me bhejo: *BasicDA,YearsOfService* (e.g. 20000,6):",
-    "calc_bonus": "Apna *monthly wage* bhejo (sirf number, max ₹21000 tak eligible):",
-    "calc_tds": (
-        "Apni *annual gross salary* bhejo (before tax; standard deduction "
-        "calculator apply karega, e.g. `900000`):"
-    ),
-    "calc_leave": ("Format me bhejo: *MonthlyBasic+DA,ELDays* (e.g. `24000,15`):"),
-    "calc_ot": "Format me bhejo: *HourlyRate,OvertimeHours* (e.g. 150,10):",
-}
-
-
-async def calc_entry(key, update, context, via_button):
-    context.user_data["calc"] = key
-    context.user_data.pop("calc_data", None)
-    context.user_data["calc_step"] = "amount"
-    prompt = CALC_PROMPTS[key]
-    if via_button:
-        await update.callback_query.message.reply_text(prompt, parse_mode="Markdown")
-    else:
-        await update.message.reply_text(prompt, parse_mode="Markdown")
-    return AMOUNT
-
-
-def parse_monthly_wages(v):
-    parts = v.split(",")
-    if len(parts) != 2:
-        raise ValueError("Enter gross remuneration and Basic+DA separated by a comma.")
-    gross = float(parts[0].strip().replace("₹", ""))
-    basic_da = float(parts[1].strip().replace("₹", ""))
-    if not math.isfinite(gross) or not math.isfinite(basic_da):
-        raise ValueError("Amounts must be finite numbers.")
-    if gross <= 0 or basic_da < 0 or basic_da > gross:
-        raise ValueError("Basic+DA must be between zero and gross remuneration.")
-    return gross, basic_da
-
-
-def code_wage_base(gross, basic_da):
-    # Add back excluded allowances above 50% of total remuneration.
-    return max(basic_da, gross * 0.50)
-
-
-def round_contribution(amount):
-    return math.floor(amount + 0.5)
-
-
-def calc_pf(v):
-    gross, basic_da = parse_monthly_wages(v)
-    wage_base = code_wage_base(gross, basic_da)
-    pf_wage = min(wage_base, EPF_WAGE_CEILING)
-    emp = round_contribution(pf_wage * 0.12)
-    employer_total = round_contribution(pf_wage * 0.12)
-    eps = round_contribution(pf_wage * 0.0833)
-    epf_employer = employer_total - eps
-    return (
-        f"🏦 *PF Calculation (FY 2026–27)*\n"
-        f"Gross remuneration: ₹{gross:,.0f}\n"
-        f"Basic+DA: ₹{basic_da:,.0f}\n"
-        f"Wage base after 50% rule: ₹{wage_base:,.2f}\n"
-        f"PF contribution wage (₹{EPF_WAGE_CEILING:,.0f} ceiling): "
-        f"₹{pf_wage:,.2f}\n"
-        f"Employee PF (12%): ₹{emp:,.0f}\n"
-        f"Employer EPS (8.33%): ₹{eps:,.0f}\n"
-        f"Employer EPF balance: ₹{epf_employer:,.0f}\n"
-        f"Total employer contribution (12%): ₹{employer_total:,.0f}\n\n"
-        f"_Assumes a covered EPF member and full-month wages from Oct 2026 "
-        f"onward. September 2026 had a mid-month ceiling change; voluntary "
-        f"contributions above the statutory ceiling may differ._" + DISCLAIMER
-    )
-
-
-def calc_esic(v):
-    gross, basic_da = parse_monthly_wages(v)
-    wage_base = code_wage_base(gross, basic_da)
-    if wage_base > ESIC_WAGE_CEILING:
-        return (
-            f"🏥 *ESIC Calculation (FY 2026–27)*\n"
-            f"Gross remuneration: ₹{gross:,.0f}\n"
-            f"Basic+DA: ₹{basic_da:,.0f}\n"
-            f"Wage base after 50% rule: ₹{wage_base:,.2f}\n"
-            f"Wage base is above the ₹{ESIC_WAGE_CEILING:,.0f} monthly "
-            f"coverage ceiling — *not eligible for a new ESIC contribution "
-            f"estimate*." + DISCLAIMER
-        )
-    emp = round_contribution(wage_base * 0.0075)
-    empr = round_contribution(wage_base * 0.0325)
-    return (
-        f"🏥 *ESIC Calculation (FY 2026–27)*\n"
-        f"Gross remuneration: ₹{gross:,.0f}\n"
-        f"Basic+DA: ₹{basic_da:,.0f}\n"
-        f"Wage base after 50% rule: ₹{wage_base:,.2f}\n"
-        f"Employee contribution (0.75%): ₹{emp:,.0f}\n"
-        f"Employer contribution (3.25%): ₹{empr:,.0f}\n"
-        f"Total contribution: ₹{emp + empr:,.0f}\n\n"
-        f"_Eligibility uses the ₹{ESIC_WAGE_CEILING:,.0f} monthly wage "
-        f"ceiling. If an already-covered employee crosses it mid-period, "
-        f"continuation rules may apply._" + DISCLAIMER
-    )
-
-
-def calc_ctc(v):
-    ctc = float(v)
-    if not math.isfinite(ctc) or ctc <= 0:
-        raise ValueError("CTC must be a positive number.")
-    monthly_ctc = ctc / 12
-    basic = monthly_ctc * 0.40
-    hra = basic * 0.50
-    pf_employer = round_contribution(min(basic, EPF_WAGE_CEILING) * 0.12)
-    other_allow = monthly_ctc - basic - hra - pf_employer
-    return (
-        f"📊 *Standard CTC Breakup (annual ₹{ctc:,.0f})*\n"
-        f"Monthly CTC: ₹{monthly_ctc:,.2f}\n"
-        f"Basic+DA (illustrative 40%): ₹{basic:,.2f}\n"
-        f"HRA (50% of Basic): ₹{hra:,.2f}\n"
-        f"Employer PF (12%, ₹{EPF_WAGE_CEILING:,.0f} ceiling): "
-        f"₹{pf_employer:,.2f}\n"
-        f"Other Allowances (balance): ₹{other_allow:,.2f}\n\n"
-        f"_Conventional example only; this option does not enforce the new "
-        f"50% wage rule. Use New Wage CTC for that calculation._" + DISCLAIMER
-    )
-
-
-def new_wage_components(gross, insurance_monthly=0.0):
-    """All monthly components for a given whole-rupee gross under the 50% wage rule."""
-    gross = int(gross)
-    basic = math.ceil(gross / 2)  # Basic+DA never below 50% of remuneration
-    hra = round_contribution(basic * 0.50)
-    special = gross - basic - hra
-    wage_base = code_wage_base(gross, basic)
-    pf_wage = min(wage_base, EPF_WAGE_CEILING)
-
-    employee_pf = round_contribution(pf_wage * 0.12)
-    employer_pf = round_contribution(pf_wage * 0.12)
-    employer_eps = round_contribution(pf_wage * 0.0833)
-    employer_epf = employer_pf - employer_eps
-    edli_admin = round_contribution(pf_wage * (EPF_ADMIN_RATE + EDLI_RATE))
-
-    esic_applicable = wage_base <= ESIC_WAGE_CEILING
-    employee_esic = round_contribution(wage_base * 0.0075) if esic_applicable else 0
-    employer_esic = round_contribution(wage_base * 0.0325) if esic_applicable else 0
-
-    gratuity = round_contribution(basic * GRATUITY_MONTHLY_FACTOR)
-    bonus = (
-        round_contribution(basic * BONUS_RATE_MIN)
-        if basic <= BONUS_ELIGIBILITY_WAGE
-        else 0
-    )
-    total_cost = (
-        gross
-        + employer_pf
-        + edli_admin
-        + employer_esic
-        + gratuity
-        + bonus
-        + insurance_monthly
-    )
-    return {
-        "gross": gross,
-        "basic": basic,
-        "hra": hra,
-        "special": special,
-        "wage_base": wage_base,
-        "pf_wage": pf_wage,
-        "employee_pf": employee_pf,
-        "employer_pf": employer_pf,
-        "employer_eps": employer_eps,
-        "employer_epf": employer_epf,
-        "edli_admin": edli_admin,
-        "esic_applicable": esic_applicable,
-        "employee_esic": employee_esic,
-        "employer_esic": employer_esic,
-        "gratuity": gratuity,
-        "bonus": bonus,
-        "insurance": insurance_monthly,
-        "total_cost": total_cost,
-    }
-
-
-def solve_new_wage_gross(monthly_ctc, insurance_monthly=0.0):
-    """Highest whole-rupee monthly gross whose total employer cost fits the CTC."""
-
-    def cost(g):
-        return new_wage_components(g, insurance_monthly)["total_cost"]
-
-    esic_top = 2 * ESIC_WAGE_CEILING  # gross at which Basic+DA hits the ESIC ceiling
-    if monthly_ctc <= cost(esic_top):
-        lo, hi = 1, esic_top  # ESIC-covered range
-    else:
-        lo, hi = esic_top + 1, max(esic_top + 1, int(monthly_ctc))
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        if cost(mid) <= monthly_ctc:
-            lo = mid
-        else:
-            hi = mid - 1
-    return lo
-
-
-def calc_ctc_new(v):
-    parts = [p.strip() for p in v.split(",")]
-    if len(parts) not in (1, 2):
-        raise ValueError("Enter CTC, optionally followed by annual insurance.")
-    ctc = parse_annual_amount(parts[0])
-    if ctc < 50000:
-        raise ValueError("Enter the ANNUAL CTC in rupees.")
-    insurance_annual = (
-        parse_annual_amount(parts[1], allow_zero=True) if len(parts) == 2 else 0.0
-    )
-    if insurance_annual >= ctc * 0.5:
-        raise ValueError("Insurance/benefit amount is too large for this CTC.")
-
-    monthly_ctc = ctc / 12
-    insurance_monthly = insurance_annual / 12
-    gross = solve_new_wage_gross(monthly_ctc, insurance_monthly)
-    c = new_wage_components(gross, insurance_monthly)
-
-    total_employer = (
-        c["employer_pf"]
-        + c["edli_admin"]
-        + c["employer_esic"]
-        + c["gratuity"]
-        + c["bonus"]
-        + insurance_monthly
-    )
-    net_before_tds = c["gross"] - c["employee_pf"] - c["employee_esic"]
-    tds = calculate_salary_tax(c["gross"] * 12, "new")["annual_tax"] / 12
-    unallocated = monthly_ctc - c["total_cost"]
-
-    lines = [
-        f"🆕 *New Wage CTC Breakup (FY 2026–27)*",
-        f"Annual CTC: ₹{ctc:,.0f}  |  Monthly CTC: ₹{monthly_ctc:,.2f}",
-        "",
-        "*💰 Earnings (monthly)*",
-        f"Basic+DA (≥50% of gross): ₹{c['basic']:,.0f}",
-        f"HRA (illustrative, 50% of Basic): ₹{c['hra']:,.0f}",
-        f"Special/Other allowance: ₹{c['special']:,.0f}",
-        f"*Gross remuneration: ₹{c['gross']:,.0f}*",
-        "",
-        "*🏢 Employer cost (monthly)*",
-        f"EPF total 12%: ₹{c['employer_pf']:,.0f} "
-        f"(EPS ₹{c['employer_eps']:,.0f} + EPF ₹{c['employer_epf']:,.0f})",
-        f"EPF admin + EDLI (0.5% + 0.5%): ₹{c['edli_admin']:,.0f}",
-    ]
-    if c["esic_applicable"]:
-        lines.append(f"ESIC 3.25%: ₹{c['employer_esic']:,.0f}")
-    else:
-        lines.append(f"ESIC: ₹0 (wage base above ₹{ESIC_WAGE_CEILING:,.0f})")
-    lines.append(f"Gratuity provision (4.81% of Basic): ₹{c['gratuity']:,.0f}")
-    if c["bonus"]:
-        lines.append(f"Statutory bonus provision (8.33% min): ₹{c['bonus']:,.0f}")
-    else:
-        lines.append(
-            f"Statutory bonus: not applicable (Basic+DA above "
-            f"₹{BONUS_ELIGIBILITY_WAGE:,.0f})"
-        )
-    if insurance_monthly:
-        lines.append(f"Insurance/other benefits: ₹{insurance_monthly:,.0f}")
-    lines += [
-        f"Total employer-side: ₹{total_employer:,.0f}",
-        f"CTC check (gross + employer-side): ₹{c['total_cost']:,.0f}"
-        + (f" (rounding balance ₹{unallocated:,.0f})" if unallocated >= 1 else ""),
-        "",
-        "*👤 Employee deductions (monthly)*",
-        f"Employee PF 12%: ₹{c['employee_pf']:,.0f}",
-        (
-            f"Employee ESIC 0.75%: ₹{c['employee_esic']:,.0f}"
-            if c["esic_applicable"]
-            else "Employee ESIC: ₹0"
-        ),
-        f"*Net before TDS/PT: ₹{net_before_tds:,.0f}*",
-        f"Est. TDS (new regime, avg): ₹{tds:,.0f}",
-        f"*Est. in-hand after TDS: ₹{net_before_tds - tds:,.0f}*",
-        "",
-        "_Annual view: "
-        f"Gross ₹{c['gross'] * 12:,.0f} + employer-side ₹{total_employer * 12:,.0f}. "
-        "Professional Tax and LWF are state-specific and not included. Bonus is "
-        "shown at the statutory minimum (calculation ceiling per Bonus Act/state "
-        "minimum wage may apply). Companies that pay variable pay, NPS, meal/LTA "
-        "or other benefits will have a different split._",
-    ]
-    return "\n".join(lines) + DISCLAIMER
-
-
-def calc_regime(v):
-    parts = v.split(",")
-    if len(parts) != 2:
-        raise ValueError("Enter annual gross and old-regime deductions.")
-    gross = parse_annual_amount(parts[0])
-    deductions = parse_annual_amount(parts[1], allow_zero=True)
-    new = calculate_salary_tax(gross, "new")
-    old = calculate_salary_tax(gross, "old", deductions)
-    new_tax, old_tax = new["annual_tax"], old["annual_tax"]
-
-    # Smallest old-regime deduction total at which Old tax <= New tax.
-    def old_tax_with(d):
-        return calculate_salary_tax(gross, "old", d)["annual_tax"]
-
-    if old_tax_with(0) <= new_tax:
-        breakeven = 0.0
-    else:
-        lo, hi = 0.0, gross
-        for _ in range(50):
-            mid = (lo + hi) / 2
-            if old_tax_with(mid) <= new_tax:
-                hi = mid
-            else:
-                lo = mid
-        breakeven = math.ceil(hi / 1000) * 1000
-
-    diff = abs(new_tax - old_tax)
-    if diff < 1:
-        verdict = "✅ Dono regime me tax lagbhag same hai."
-    elif new_tax < old_tax:
-        verdict = f"✅ *New regime better* — ₹{diff:,.0f}/year bachega."
-    else:
-        verdict = f"✅ *Old regime better* — ₹{diff:,.0f}/year bachega."
-
-    result = (
-        f"🧮 *Old vs New Regime — FY 2026–27*\n"
-        f"Annual gross: ₹{gross:,.0f}\n\n"
-        f"*New regime*\n"
-        f"Taxable: ₹{new['taxable_income']:,.0f}\n"
-        f"Tax: ₹{new_tax:,.0f} (≈ ₹{new_tax / 12:,.0f}/month)\n\n"
-        f"*Old regime* (std ₹50,000 + deductions ₹{deductions:,.0f})\n"
-        f"Taxable: ₹{old['taxable_income']:,.0f}\n"
-        f"Tax: ₹{old_tax:,.0f} (≈ ₹{old_tax / 12:,.0f}/month)\n\n"
-        f"{verdict}\n"
-    )
-    if breakeven > 0:
-        result += (
-            f"Old regime ko jeetne ke liye total deductions/exemptions kam se "
-            f"kam ≈ ₹{breakeven:,.0f} chahiye.\n"
-        )
-    else:
-        result += "Bina kisi deduction ke bhi old regime new se sasta hai.\n"
-    result += (
-        "\n_Assumes resident individual under 60, salary income only, 12 months. "
-        "Employer NPS (80CCD(2)) can reduce taxable salary in both regimes — "
-        "deduct it from gross before using this tool._"
-    )
-    return result + DISCLAIMER
-
-
-def calc_gratuity(v):
-    basic_str, years_str = v.split(",")
-    basic = float(basic_str.strip())
-    years = float(years_str.strip())
-    if years < 5:
-        return (
-            f"Years of service ({years}) < 5 — generally *not eligible* "
-            f"for gratuity (unless fixed-term employee under new codes)." + DISCLAIMER
-        )
-    gratuity = (basic * 15 * years) / 26
-    return (
-        f"🎁 *Gratuity Calculation*\n"
-        f"Last drawn Basic+DA: ₹{basic:,.0f}\n"
-        f"Years of service: {years}\n"
-        f"*Gratuity amount: ₹{gratuity:,.2f}*" + DISCLAIMER
-    )
-
-
-def calc_bonus(v):
-    wage = float(v)
-    if wage > 21000:
-        return (
-            f"Wage ₹{wage:,.0f} > ₹21,000 — *not eligible* for statutory bonus."
-            + DISCLAIMER
-        )
-    min_bonus = wage * 12 * 0.0833
-    max_bonus = wage * 12 * 0.20
-    return (
-        f"🎯 *Bonus Range (annual)*\n"
-        f"Monthly wage: ₹{wage:,.0f}\n"
-        f"Minimum bonus (8.33%): ₹{min_bonus:,.2f}\n"
-        f"Maximum bonus (20%): ₹{max_bonus:,.2f}" + DISCLAIMER
-    )
-
-
-def slab_tax(taxable_income, regime, age_band="under_60"):
-    if regime == "new":
-        slabs = [
-            (400000, 0.00),
-            (800000, 0.05),
-            (1200000, 0.10),
-            (1600000, 0.15),
-            (2000000, 0.20),
-            (2400000, 0.25),
-            (float("inf"), 0.30),
-        ]
-    else:
-        exemption_limit = {
-            "under_60": 250000,
-            "60_to_79": 300000,
-            "80_plus": 500000,
-        }.get(age_band, 250000)
-        slabs = [(exemption_limit, 0.00)]
-        if exemption_limit < 500000:
-            slabs.append((500000, 0.05))
-        slabs.extend(
-            [
-                (1000000, 0.20),
-                (float("inf"), 0.30),
-            ]
-        )
-
-    tax = 0.0
-    lower = 0.0
-    for upper, rate in slabs:
-        amount_in_slab = max(0.0, min(taxable_income, upper) - lower)
-        tax += amount_in_slab * rate
-        if taxable_income <= upper:
-            break
-        lower = upper
-    return tax
-
-
-def tax_after_rebate(taxable_income, regime, age_band="under_60"):
-    tax = slab_tax(taxable_income, regime, age_band)
-    if regime == "new":
-        if taxable_income <= 1200000:
-            return max(0.0, tax - 60000)
-        # Marginal relief just above ₹12 lakh of taxable income.
-        return min(tax, taxable_income - 1200000)
-    if taxable_income <= 500000:
-        return max(0.0, tax - 12500)
-    return tax
-
-
-def tax_with_surcharge(taxable_income, regime, age_band="under_60"):
-    tax = tax_after_rebate(taxable_income, regime, age_band)
-    if regime == "new":
-        surcharge_bands = [
-            (5000000, 0.10),
-            (10000000, 0.15),
-            (20000000, 0.25),
-        ]
-    else:
-        surcharge_bands = [
-            (5000000, 0.10),
-            (10000000, 0.15),
-            (20000000, 0.25),
-            (50000000, 0.37),
-        ]
-
-    selected_threshold = None
-    previous_rate = 0.0
-    selected_rate = 0.0
-    for threshold, rate in surcharge_bands:
-        if taxable_income > threshold:
-            selected_threshold = threshold
-            previous_rate = selected_rate
-            selected_rate = rate
-        else:
-            break
-
-    if selected_threshold is None:
-        return tax
-
-    with_surcharge = tax * (1 + selected_rate)
-    threshold_tax = tax_after_rebate(selected_threshold, regime, age_band)
-    marginal_relief_cap = (
-        threshold_tax * (1 + previous_rate) + taxable_income - selected_threshold
-    )
-    return min(with_surcharge, marginal_relief_cap)
-
-
-def calculate_salary_tax(annual_gross, regime, old_deductions=0, age_band="under_60"):
-    standard_deduction = 75000 if regime == "new" else 50000
-    other_deductions = old_deductions if regime == "old" else 0
-    taxable_income = max(0.0, annual_gross - standard_deduction - other_deductions)
-    tax_before_cess = tax_with_surcharge(taxable_income, regime, age_band)
-    cess = tax_before_cess * 0.04
-    return {
-        "annual_gross": annual_gross,
-        "standard_deduction": standard_deduction,
-        "other_deductions": other_deductions,
-        "taxable_income": taxable_income,
-        "annual_tax": tax_before_cess + cess,
-        "age_band": age_band,
-    }
-
-
-def build_tds_result(annual_gross, regime, old_deductions=0, age_band="under_60"):
-    tax = calculate_salary_tax(annual_gross, regime, old_deductions, age_band)
-    regime_name = "New" if regime == "new" else "Old"
-    age_text = {
-        "under_60": "under 60",
-        "60_to_79": "60–79",
-        "80_plus": "80+",
-    }[age_band]
-    result = (
-        f"🧾 *TDS Estimate — {regime_name} Regime (FY 2026–27)*\n"
-        f"Annual gross salary: ₹{tax['annual_gross']:,.0f}\n"
-        f"Standard deduction: ₹{tax['standard_deduction']:,.0f}\n"
-    )
-    if regime == "old":
-        result += (
-            f"Other eligible deductions/exemptions entered: "
-            f"₹{tax['other_deductions']:,.0f}\n"
-        )
-    result += (
-        f"Estimated taxable salary: ₹{tax['taxable_income']:,.0f}\n"
-        f"Estimated annual tax (rebate, marginal relief, surcharge and "
-        f"4% cess included): "
-        f"₹{tax['annual_tax']:,.0f}\n"
-        f"*Average monthly TDS: ₹{tax['annual_tax'] / 12:,.0f}*\n\n"
-        f"_Assumes a resident individual age {age_text} with salary income for "
-        f"12 months. For the old regime, enter only eligible deductions/"
-        f"exemptions in addition to the standard deduction._" + DISCLAIMER
-    )
-    return result
-
-
-def build_net_salary_result(
-    monthly_gross, basic_da, regime, old_deductions=0, age_band="under_60"
-):
-    wage_base = code_wage_base(monthly_gross, basic_da)
-    pf_wage = min(wage_base, EPF_WAGE_CEILING)
-    pf_employee = round_contribution(pf_wage * 0.12)
-    esic_employee = (
-        round_contribution(wage_base * 0.0075) if wage_base <= ESIC_WAGE_CEILING else 0
-    )
-    tax = calculate_salary_tax(monthly_gross * 12, regime, old_deductions, age_band)
-    monthly_tds = tax["annual_tax"] / 12
-    net = monthly_gross - pf_employee - esic_employee - monthly_tds
-    regime_name = "New" if regime == "new" else "Old"
-    esic_line = (
-        f"ESIC employee contribution: ₹{esic_employee:,.0f}"
-        if esic_employee
-        else f"ESIC: not included (wage base exceeds ₹{ESIC_WAGE_CEILING:,.0f})"
-    )
-    old_deduction_line = (
-        f"\nOld-regime deductions/exemptions: ₹{old_deductions:,.0f}"
-        if regime == "old"
-        else ""
-    )
-    return (
-        f"💵 *Net Salary Estimate — {regime_name} Regime*\n"
-        f"Monthly gross remuneration: ₹{monthly_gross:,.0f}\n"
-        f"Basic+DA: ₹{basic_da:,.0f}\n"
-        f"Wage base after 50% rule: ₹{wage_base:,.2f}\n"
-        f"Employee PF: ₹{pf_employee:,.0f}\n"
-        f"{esic_line}\n"
-        f"Taxable annual salary: ₹{tax['taxable_income']:,.0f}"
-        f"{old_deduction_line}\n"
-        f"Average monthly TDS: ₹{monthly_tds:,.0f}\n"
-        f"Professional Tax: not included (state-specific)\n"
-        f"*Estimated monthly net pay: ₹{net:,.0f}*\n\n"
-        f"_TDS includes the regime's standard deduction, applicable rebate, "
-        f"marginal relief, surcharge and 4% cess. Assumes a resident individual age "
-        f"{ {'under_60': 'under 60', '60_to_79': '60–79', '80_plus': '80+'}[age_band] }, "
-        f"salary income for 12 months, and no other income._" + DISCLAIMER
-    )
-
-
-def calc_leave(v):
-    parts = v.split(",")
-    if len(parts) != 2:
-        raise ValueError("Enter monthly basic and EL days separated by a comma.")
-    monthly_basic = float(parts[0].strip().replace("₹", ""))
-    days = float(parts[1].strip())
-    if (
-        not math.isfinite(monthly_basic)
-        or not math.isfinite(days)
-        or monthly_basic <= 0
-        or days < 0
-    ):
-        raise ValueError("Enter valid positive amounts.")
-    per_day = monthly_basic / 30
-    amount = per_day * days
-    return (
-        f"🏖 *Leave Encashment*\n"
-        f"Monthly Basic+DA: ₹{monthly_basic:,.2f}\n"
-        f"Per day rate (Basic ÷ 30): ₹{per_day:,.2f}\n"
-        f"EL days to encash: {days:g}\n"
-        f"*Encashment amount: ₹{amount:,.2f}*\n\n"
-        f"_Uses the 30-day divisor. Some employers use 26 days or actual "
-        f"calendar days, so follow your company leave policy._" + DISCLAIMER
-    )
-
-
-def calc_ot(v):
-    rate_str, hours_str = v.split(",")
-    rate = float(rate_str.strip())
-    hours = float(hours_str.strip())
-    amount = rate * 2 * hours
-    return (
-        f"⏰ *Overtime Pay*\n"
-        f"Hourly rate: ₹{rate:,.2f}\n"
-        f"Overtime hours: {hours}\n"
-        f"Rate applied: 2x normal\n"
-        f"*Overtime pay: ₹{amount:,.2f}*" + DISCLAIMER
-    )
-
-
-CALC_FUNCS = {
-    "calc_pf": calc_pf,
-    "calc_esic": calc_esic,
-    "calc_ctc": calc_ctc,
-    "calc_ctc_new": calc_ctc_new,
-    "calc_regime": calc_regime,
-    "calc_gratuity": calc_gratuity,
-    "calc_bonus": calc_bonus,
-    "calc_leave": calc_leave,
-    "calc_ot": calc_ot,
-}
-
-
-def parse_annual_amount(value, allow_zero=False):
-    normalized = value.strip().replace("₹", "").replace(",", "").replace(" ", "")
-    amount = float(normalized)
-    if not math.isfinite(amount) or amount < 0 or (amount == 0 and not allow_zero):
-        raise ValueError("Enter a valid non-negative amount.")
-    return amount
-
-
-def tax_regime_keyboard():
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "New regime (default)", callback_data="taxreg_new"
-                ),
-                InlineKeyboardButton("Old regime", callback_data="taxreg_old"),
-            ]
-        ]
-    )
-
-
-def old_regime_age_keyboard():
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("Under 60", callback_data="taxage_under_60")],
-            [InlineKeyboardButton("60–79", callback_data="taxage_60_to_79")],
-            [InlineKeyboardButton("80+", callback_data="taxage_80_plus")],
-        ]
-    )
-
-
-def clear_calc_state(context):
-    for key in (
-        "calc",
-        "calc_data",
-        "calc_step",
-        "tax_regime",
-        "tax_age_band",
-    ):
-        context.user_data.pop(key, None)
-
-
-def build_selected_calculation(context, regime, old_deductions=0):
-    key = context.user_data.get("calc")
-    data = context.user_data.get("calc_data", {})
-    age_band = context.user_data.get("tax_age_band", "under_60")
-    if key == "calc_tds":
-        return build_tds_result(data["annual_gross"], regime, old_deductions, age_band)
-    if key == "calc_salary":
-        return build_net_salary_result(
-            data["monthly_gross"],
-            data["basic_da"],
-            regime,
-            old_deductions,
-            age_band,
-        )
-    raise ValueError("Calculator session expired.")
-
-
-async def receive_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    key = context.user_data.get("calc")
-    value = update.message.text.strip()
-    if key not in CALC_PROMPTS:
-        await update.message.reply_text(
-            "Calculator session expired. /start karke calculator dobara chuno."
-        )
-        return ConversationHandler.END
-    try:
-        if key == "calc_salary":
-            gross, basic_da = parse_monthly_wages(value)
-            context.user_data["calc_data"] = {
-                "monthly_gross": gross,
-                "basic_da": basic_da,
-            }
-            context.user_data["calc_step"] = "tax_regime"
-            await update.message.reply_text(
-                "TDS ke liye tax regime chuno:",
-                reply_markup=tax_regime_keyboard(),
-            )
-            return TAX_REGIME
-
-        if key == "calc_tds":
-            annual_gross = parse_annual_amount(value)
-            context.user_data["calc_data"] = {"annual_gross": annual_gross}
-            context.user_data["calc_step"] = "tax_regime"
-            await update.message.reply_text(
-                "FY 2026–27 ke liye tax regime chuno:",
-                reply_markup=tax_regime_keyboard(),
-            )
-            return TAX_REGIME
-
-        result = CALC_FUNCS[key](value)
-    except (ValueError, TypeError, OverflowError):
-        await update.message.reply_text(
-            "⚠️ Input sahi format me bhejo. " + CALC_PROMPTS[key],
-            parse_mode="Markdown",
-        )
-        return AMOUNT
-    clear_calc_state(context)
-    await update.message.reply_text(result, parse_mode="Markdown")
-    return ConversationHandler.END
-
-
-async def select_tax_regime(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    regime = query.data.rsplit("_", 1)[1]
-    if not context.user_data.get("calc_data"):
-        clear_calc_state(context)
-        await query.message.reply_text(
-            "Calculator session expired. /start karke dobara chuno."
-        )
-        return ConversationHandler.END
-
-    context.user_data["tax_regime"] = regime
-    if regime == "old":
-        context.user_data["calc_step"] = "old_age"
-        await query.message.reply_text(
-            "Old regime ke liye age group chuno:",
-            reply_markup=old_regime_age_keyboard(),
-        )
-        return OLD_AGE
-
-    result = build_selected_calculation(context, regime)
-    clear_calc_state(context)
-    await query.message.reply_text(result, parse_mode="Markdown")
-    return ConversationHandler.END
-
-
-async def select_old_regime_age(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    age_band = query.data.removeprefix("taxage_")
-    if age_band not in {"under_60", "60_to_79", "80_plus"}:
-        return OLD_AGE
-    context.user_data["tax_age_band"] = age_band
-    context.user_data["calc_step"] = "old_deductions"
-    await query.message.reply_text(
-        "Standard deduction ke alawa total *eligible annual "
-        "deductions/exemptions* bhejo (jaise eligible 80C, 80D, HRA; "
-        "₹50,000 standard deduction alag se apply hogi). "
-        "Koi deduction nahi ho to `0` bhejo:",
-        parse_mode="Markdown",
-    )
-    return OLD_DEDUCTIONS
-
-
-async def receive_old_deductions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        deductions = parse_annual_amount(update.message.text, allow_zero=True)
-        result = build_selected_calculation(context, "old", deductions)
-    except (ValueError, TypeError, OverflowError, KeyError):
-        await update.message.reply_text(
-            "⚠️ Eligible annual deductions/exemptions ka valid number bhejo, "
-            "ya kuch nahi ho to `0`.",
-            parse_mode="Markdown",
-        )
-        return OLD_DEDUCTIONS
-    clear_calc_state(context)
-    await update.message.reply_text(result, parse_mode="Markdown")
-    return ConversationHandler.END
-
-
-async def remind_tax_regime(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Old ya New regime ke button ko tap karo.")
-    return TAX_REGIME
-
-
-async def remind_old_regime_age(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Age group ke button ko tap karo.")
-    return OLD_AGE
-
-
-async def pending_amount_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if (
-        context.user_data.get("calc_step") == "amount"
-        and context.user_data.get("calc") in CALC_PROMPTS
-    ):
-        return await receive_amount(update, context)
-
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    clear_calc_state(context)
-    await update.message.reply_text("Cancelled. /start se dobara shuru karo.")
-    return ConversationHandler.END
-
-
-async def restart_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await start(update, context)
-    return ConversationHandler.END
-
-
-# ---------------- JSON STORAGE HELPERS ----------------
-
-
-def load_json(path, default):
-    try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return default
-
-
-def save_json(path, data):
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
-        os.replace(tmp, path)
-    except OSError:
-        logger.exception("Could not save %s", path)
-
-
-# ---------------- STATE MINIMUM WAGES ----------------
-
-
-def load_minwages():
-    data = load_json(MINWAGE_FILE, {})
-    if not isinstance(data, dict):
-        data = {}
-    data.setdefault("states", {})
-    data.setdefault("changes", [])
-    return data
-
-
-def minwage_keyboard():
-    rows, row = [], []
-    for i, s in enumerate(STATES):
-        row.append(InlineKeyboardButton(s, callback_data=f"mw_{i}"))
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    return InlineKeyboardMarkup(rows)
-
-
-def format_minwage(state):
-    rec = load_minwages()["states"].get(state)
-    if not rec:
-        return (
-            f"💰 <b>{html.escape(state)}</b>\n"
-            "Is state ka verified data abhi add nahi hua. Official labour "
-            "department notification check karo."
-        )
-    r = rec["rates"]
-    text = (
-        f"💰 <b>Minimum Wages — {html.escape(state)}</b>\n"
-        f"Effective from: {html.escape(rec['effective'])}\n\n"
-        f"Unskilled: ₹{r[0]:,.0f}/month\n"
-        f"Semi-skilled: ₹{r[1]:,.0f}/month\n"
-        f"Skilled: ₹{r[2]:,.0f}/month\n"
-        f"Highly skilled: ₹{r[3]:,.0f}/month\n"
-    )
-    if rec.get("source"):
-        text += (
-            f'\n<a href="{html.escape(rec["source"], quote=True)}">'
-            "Official source</a>\n"
-        )
-    text += (
-        f"\n<i>Last verified: {html.escape(rec.get('verified', 'n/a'))}. "
-        "Zone/area-wise rates, industry (scheduled employment) aur VDA alag ho "
-        "sakte hain — notification se confirm karo.</i>"
-    )
-    return text
-
-
-async def minwage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await get_message(update).reply_text(
-        "💰 State chuno (minimum wages):", reply_markup=minwage_keyboard()
-    )
-
-
-async def minwage_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data == "mw_menu":
-        await query.message.reply_text(
-            "💰 State chuno (minimum wages):", reply_markup=minwage_keyboard()
-        )
-        return
-    try:
-        state = STATES[int(query.data.removeprefix("mw_"))]
-    except (ValueError, IndexError):
-        return
-    await send_html(query.message, format_minwage(state))
-
-
-async def setwage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin only. Usage:
-    /setwage Haryana | 2026-10-01 | 13000,14000,15500,17000 | https://source
-    (rates = unskilled, semi-skilled, skilled, highly skilled; per month;
-    source URL is optional)"""
-    user = update.effective_user
-    if not user or user.id not in ADMIN_IDS:
-        await update.message.reply_text("Not authorised.")
-        return
-    try:
-        raw = update.message.text.split(maxsplit=1)[1]
-        parts = [p.strip() for p in raw.split("|")]
-        state = next(s for s in STATES if s.lower() == parts[0].lower())
-        effective = datetime.strptime(parts[1], "%Y-%m-%d").date().isoformat()
-        rates = [float(x) for x in parts[2].replace("₹", "").split(",")]
-        if len(rates) != 4 or any(not math.isfinite(r) or r <= 0 for r in rates):
+def labels(spec):
+    return {n: l for n, l, *_ in spec["inputs"]} | {n: l for n, l, f, _ in spec["rows"] if f}
+
+
+def prompt(key):
+    s = SPECS[key]
+    ins = s["inputs"][:-1] if s.get("solve") else s["inputs"]
+    return (f"📥 {s['title']}\nBhejo (comma se alag): " + ", ".join(l if d is None else f"[{l}]" for _, l, d in ins)
+            + f"\nExample: {s['ex']}\n([ ] wale optional hain; numbers me thousand comma mat lagao)")
+
+
+def parse(spec, text):
+    ins = spec["inputs"][:-1] if spec.get("solve") else spec["inputs"]
+    parts = [text.replace(",", "")] if len(ins) == 1 else text.split(",")
+    if len(parts) > len(ins):
+        raise ValueError
+    vals = {}
+    for i, (n, _, d) in enumerate(ins):
+        if i < len(parts):
+            x = float(parts[i].strip().replace("₹", ""))
+        elif d is None:
             raise ValueError
-        source = parts[3] if len(parts) > 3 else ""
-    except (IndexError, StopIteration, ValueError):
-        await update.message.reply_text(
-            "Format:\n/setwage State | YYYY-MM-DD | "
-            "unskilled,semi,skilled,highly | source_url(optional)"
-        )
-        return
-
-    data = load_minwages()
-    old = data["states"].get(state)
-    today = datetime.now(IST).date().isoformat()
-    data["states"][state] = {
-        "effective": effective,
-        "rates": rates,
-        "source": source,
-        "verified": today,
-    }
-    changed = (not old) or old["rates"] != rates
-    if changed:
-        data["changes"].append(
-            {
-                "id": f"{state}|{effective}|{today}",
-                "state": state,
-                "effective": effective,
-                "old": old["rates"] if old else None,
-                "new": rates,
-                "announced": today,
-            }
-        )
-        data["changes"] = data["changes"][-100:]
-    save_json(MINWAGE_FILE, data)
-    await update.message.reply_text(
-        f"✅ {state} minimum wages saved."
-        + (" Next daily alert me jayega." if changed else " (Rates same the, sirf verified date update hui.)")
-    )
+        else:
+            x = d
+        if not math.isfinite(x) or x < 0:
+            raise ValueError
+        vals[n] = x
+    if not spec.get("chk", lambda v: True)(vals):
+        raise ValueError
+    if spec.get("solve"):  # highest whole-rupee gross whose total cost fits the CTC
+        cost = lambda g: run(spec, {**vals, "gross": g})["total"]
+        tgt, top = vals["ctc"] / 12, 42000
+        lo, hi = (1, top) if tgt <= cost(top) else (top + 1, max(top + 1, int(tgt)))
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            lo, hi = (mid, hi) if cost(mid) <= tgt else (lo, mid - 1)
+        vals["gross"] = lo
+    return vals
 
 
-async def mwstatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin only: which states have data and which are still missing."""
-    user = update.effective_user
-    if not user or user.id not in ADMIN_IDS:
-        await update.message.reply_text("Not authorised.")
-        return
-    data = load_minwages()["states"]
-    have = [s for s in STATES if s in data]
-    missing = [s for s in STATES if s not in data]
-    lines = [f"Data added: {len(have)}/{len(STATES)}"]
-    for s in have:
-        lines.append(f"✅ {s} — effective {data[s]['effective']}, verified {data[s].get('verified', 'n/a')}")
-    if missing:
-        lines.append("\nPending: " + ", ".join(missing))
-    await update.message.reply_text("\n".join(lines)[:4000])
+# ======================= EXCEL + IMAGE OUTPUT =======================
+def hdr_style(ws, row=1):
+    for c in ws[row]:
+        c.font, c.fill = Font(bold=True, color="FFFFFF"), PatternFill("solid", fgColor="1F4E78")
+        c.alignment = Alignment(horizontal="center", vertical="center")
 
 
-def tag_minwage_news(items):
-    """Headlines about minimum wage / VDA, with any state names found in the title."""
-    out = []
-    for it in items:
-        t = it["title"].lower()
-        if (
-            "minimum wage" in t
-            or re.search(r"\bvda\b", t)
-            or "dearness allowance" in t
-        ):
-            states = [
-                s
-                for s in STATES
-                if re.search(rf"\b{re.escape(s.lower())}\b", t)
-            ]
-            out.append((it, states))
+def as_table(ws, name, ref=None, widths=None):
+    if ws.max_row > 1:
+        ws.add_table(Table(displayName=name, ref=ref or ws.dimensions,
+                           tableStyleInfo=TableStyleInfo(name="TableStyleMedium2", showRowStripes=True)))
+    for i, col in enumerate(ws.columns):
+        w = widths[i] if widths else min(60, max(len(str(c.value or "")) for c in col) + 2)
+        ws.column_dimensions[col[0].column_letter].width = w
+    ws.freeze_panes = "A2" if not widths else "A5"
+
+
+def make_xlsx(spec, v):
+    wb = Workbook(); ws = wb.active; ws.title = "Calculation"
+    ws["A1"], ws["A1"].font = spec["title"] + " (FY 2026–27)", Font(bold=True, size=14)
+    ws["A2"] = "Yellow = input (badlo, formulas auto-update). Indicative estimate; verify before payroll use."
+    ws.append([]); ws.append(["Item", "Value", "How calculated", "Note"]); hdr_style(ws, 4)
+    cell, lab, r = {}, {}, 5
+    sub_ref = lambda f: REF.sub(lambda m: cell[m[1]], f)
+    sub_lab = lambda f: REF.sub(lambda m: "[" + lab[m[1]] + "]", f)
+    for n, l, d in spec["inputs"]:
+        ws.cell(r, 1, l); c = ws.cell(r, 2, v[n]); c.fill = PatternFill("solid", fgColor="FFF2CC")
+        c.number_format = "#,##0.00"; ws.cell(r, 3, "Input"); cell[n], lab[n] = f"B{r}", l; r += 1
+    for n, l, f, note in spec["rows"]:
+        ws.cell(r, 1, l)
+        if f:
+            ws.cell(r, 2, "=" + sub_ref(f)).number_format = "#,##0.00"
+            ws.cell(r, 3, "ƒ " + sub_lab(f)); ws.cell(r, 4, note); cell[n], lab[n] = f"B{r}", l
+        else:
+            ws.cell(r, 1).font = Font(bold=True, color="1F4E78")
+        r += 1
+    for row in ws.iter_rows(min_row=5, max_row=r - 1, min_col=1, max_col=4):
+        for c in row:
+            c.alignment = Alignment(wrap_text=True, vertical="top")
+    as_table(ws, "Calc", f"A4:D{r - 1}", widths=[40, 18, 55, 38])
+    out = BytesIO(); wb.save(out); out.seek(0)
     return out
 
 
-# ---------------- DAILY UPDATES (news feed + subscriptions) ----------------
+def make_png(spec, v):
+    num = lambda x: f"{x:,.0f}" if abs(x - round(x)) < 1e-9 else f"{x:,.2f}"
+    rows = [(l, num(v[n]), "Input") for n, l, _ in spec["inputs"]]
+    rows += [(l, num(v[n]), note) if f else (l, "", "") for n, l, f, note in spec["rows"]]
+    fig = Figure(figsize=(9, 0.4 * len(rows) + 1.3))
+    ax = fig.subplots(); ax.axis("off"); ax.set_title(spec["title"] + " – FY 2026–27", fontweight="bold", color="#1F4E78")
+    t = ax.table(cellText=rows, colLabels=["Item", "Value (₹)", "Note"], loc="upper center", cellLoc="left", colWidths=[.5, .16, .34])
+    t.auto_set_font_size(False); t.set_fontsize(9); t.scale(1, 1.5)
+    for (r, c), cl in t.get_celld().items():
+        if r == 0:
+            cl.set_facecolor("#1F4E78"); cl.set_text_props(color="white", fontweight="bold")
+        elif rows[r - 1][2] == "Input":
+            cl.set_facecolor("#FFF2CC")
+        elif not rows[r - 1][1]:
+            cl.set_facecolor("#D9E1F2"); cl.set_text_props(fontweight="bold")
+        elif r % 2 == 0:
+            cl.set_facecolor("#F2F2F2")
+    out = BytesIO(); fig.savefig(out, format="png", dpi=150, bbox_inches="tight"); out.seek(0)
+    return out
 
 
-def get_subscribers():
-    return set(load_json(SUBSCRIBERS_FILE, []))
+async def calc_reply(msg, key, text):
+    spec = SPECS[key]; v = run(spec, parse(spec, text)); lab = labels(spec)
+    cap = f"📊 {spec['title']}\n" + "\n".join(f"{lab[n]}: ₹{v[n]:,.0f}" for n in spec["res"])
+    cap += "\n\n📎 Neeche Excel bhi hai (formulas + table).\n" + NOTE
+    await msg.reply_photo(make_png(spec, v), caption=cap[:1024])
+    await msg.reply_document(make_xlsx(spec, v), filename=f"{key}_calculation.xlsx")
 
 
-def subscribe_keyboard(chat_id):
-    subscribed = chat_id in get_subscribers()
-    label = (
-        "🔕 Daily alerts band karo" if subscribed else "🔔 Daily alerts chalu karo"
-    )
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton(label, callback_data="info_subscribe")]]
-    )
+# ======================= INFO TEXTS / MENU =======================
+INFO = {
+    "info_compliance": (
+        "📆 *Compliance Calendar — HR Teams*\n\n*🗓 Monthly*\n- 7th: Salary processing, pay slip, TDS deposit\n"
+        "- 15th: EPF & ESIC payment\n- Professional Tax / LWF: state-wise\n\n*📅 Annual*\n"
+        "- Bonus Act: within 8 months of FY-end\n- Shop & Establishment renewal\n"
+        "- Annual returns: POSH, Child Labour, Gratuity, Maternity Benefit, Equal Remuneration, CLRA\n\n"
+        "*📚 Registers (monthly)*\nMuster Roll, Wages, Overtime, Accident, Deduction/Fine/Advance, Leave, Employee Master\n\n"
+        "*📌 Also*\n- TDS 24Q return: 31 Jul, 31 Oct, 31 Jan, 31 May\n- Form 16: by 15 June\n\n"
+        "_State dates (PT, LWF, S&E) alag hote hain — state labour portal check karo._\n\n" + NOTE),
+    "info_taxsave": (
+        "💡 *Tax Saver*\n\n*1️⃣ Sahi regime chuno* — New: ₹75,000 std deduction, ₹12L taxable tak rebate. "
+        "Old tab jeetta hai jab HRA, home loan, 80C, 80D zyada ho. Neeche button se compare karo.\n\n"
+        "*2️⃣ Dono regime me* — Employer NPS 80CCD(2): Basic+DA ka 14% tak; employer PF+NPS+superannuation ₹7.5L/yr tak tax-free.\n\n"
+        "*3️⃣ Sirf Old regime me* — 80C ₹1.5L, NPS extra ₹50,000, 80D, HRA (rent receipts; ₹1L+ rent par landlord PAN), "
+        "home loan interest ₹2L, education loan, 80G, LTA.\n\n"
+        "*4️⃣ Payroll checklist* — April me declaration, Dec–Jan me proofs; pichhle employer ka Form 12B lo; "
+        "extra TDS ka refund ITR se.\n\n" + NOTE),
+    "info_templates": "📁 *HR Templates*\n\nComing soon: offer/appointment letters, payslip, FnF settlement formats.",
+    "info_premium": "⭐ *Premium*\n\nPlanned: bulk payroll reports, state-wise compliance tracker, auto payslips.",
+}
+MENU = [("🏦 PF", "calc_pf"), ("🏥 ESIC", "calc_esic"), ("📊 CTC Breakup", "calc_ctc"), ("🆕 New Wage CTC", "calc_ctc_new"),
+        ("💵 Net Salary", "calc_salary"), ("🎁 Gratuity", "calc_gratuity"), ("🎯 Bonus", "calc_bonus"),
+        ("🏖 Leave Encashment", "calc_leave"), ("🧾 TDS Old vs New", "calc_tds"), ("⏰ Overtime", "calc_ot"),
+        ("💰 State Min Wages", "mw_menu"), ("📆 Compliance Calendar", "info_compliance"), ("📰 Updates", "info_updates"),
+        ("💡 Tax Saver", "info_taxsave"), ("🔔 Daily Alerts", "info_subscribe"), ("📁 HR Templates", "info_templates"),
+        ("⭐ Premium", "info_premium")]
+menu = lambda: Kb([[Btn(t, callback_data=c) for t, c in MENU[i:i + 2]] for i in range(0, len(MENU), 2)])
 
 
-async def toggle_subscription(update, context, force=None):
-    """force: 'on', 'off' or None (toggle)."""
-    chat_id = update.effective_chat.id
-    subs = get_subscribers()
-    turn_on = (chat_id not in subs) if force is None else (force == "on")
-    if turn_on:
-        subs.add(chat_id)
-        text = (
-            f"🔔 Daily alerts *ON*. Roz subah {DAILY_UPDATE_HOUR_IST}:00 IST par "
-            "labour code/compliance headlines, state minimum wage changes aur "
-            "upcoming due dates milenge. Band karne ke liye /unsubscribe."
-        )
-    else:
-        subs.discard(chat_id)
-        text = "🔕 Daily alerts *OFF*. Dobara chalu karne ke liye /subscribe."
-    save_json(SUBSCRIBERS_FILE, sorted(subs))
-    await get_message(update).reply_text(text, parse_mode="Markdown")
+# ======================= STORAGE + MIN WAGES =======================
+def load(p, d):
+    try:
+        return json.loads(Path(p).read_text("utf-8"))
+    except (OSError, ValueError):
+        return d
 
 
-async def subscribe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await toggle_subscription(update, context, force="on")
+def save(p, data):
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp"); tmp.write_text(json.dumps(data, ensure_ascii=False), "utf-8"); os.replace(tmp, p)
+    except OSError:
+        log.exception("save failed %s", p)
 
 
-async def unsubscribe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await toggle_subscription(update, context, force="off")
+def mw_data():
+    d = load(MW, {}); d = d if isinstance(d, dict) else {}
+    d.setdefault("states", {}); d.setdefault("changes", [])
+    return d
 
 
-async def fetch_news_query(client, query):
-    url = (
-        "https://news.google.com/rss/search?q="
-        + quote_plus(query + " when:7d")
-        + "&hl=en-IN&gl=IN&ceid=IN:en"
-    )
-    resp = await client.get(url)
-    resp.raise_for_status()
-    root = ET.fromstring(resp.content)
-    items = []
-    for it in root.iter("item"):
-        title = (it.findtext("title") or "").strip()
-        link = (it.findtext("link") or "").strip()
-        if not title or not link:
+def mw_kb():
+    return Kb([[Btn(s, callback_data=f"mw_{i}") for i, s in enumerate(STATES) if i // 2 == j] for j in range((len(STATES) + 1) // 2)])
+
+
+def mw_text(state):
+    rec, e = mw_data()["states"].get(state), html.escape
+    if not rec:
+        return f"💰 <b>{e(state)}</b>\nIs state ka verified data abhi add nahi hua. Official labour department notification check karo."
+    r = rec["rates"]
+    src = f'\n<a href="{e(rec["source"], quote=True)}">Official source</a>\n' if rec.get("source") else ""
+    return (f"💰 <b>Minimum Wages — {e(state)}</b>\nEffective from: {e(rec['effective'])}\n\n"
+            f"Unskilled: ₹{r[0]:,.0f}/month\nSemi-skilled: ₹{r[1]:,.0f}/month\nSkilled: ₹{r[2]:,.0f}/month\n"
+            f"Highly skilled: ₹{r[3]:,.0f}/month\n{src}\n<i>Last verified: {e(rec.get('verified', 'n/a'))}. Zone/industry/VDA "
+            "alag ho sakte hain — notification se confirm karo.</i>")
+
+
+admin = lambda u: bool(u.effective_user and u.effective_user.id in ADMIN_IDS)
+
+
+async def setwage_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/setwage State | YYYY-MM-DD | unskilled,semi,skilled,highly | source_url(optional)"""
+    if not admin(update):
+        return await update.message.reply_text("Not authorised.")
+    try:
+        p = [x.strip() for x in update.message.text.split(maxsplit=1)[1].split("|")]
+        state = next(s for s in STATES if s.lower() == p[0].lower())
+        eff = datetime.strptime(p[1], "%Y-%m-%d").date().isoformat()
+        rates = [float(x) for x in p[2].replace("₹", "").split(",")]
+        if len(rates) != 4 or any(not math.isfinite(x) or x <= 0 for x in rates):
+            raise ValueError
+    except (IndexError, StopIteration, ValueError):
+        return await update.message.reply_text("Format:\n/setwage State | YYYY-MM-DD | unskilled,semi,skilled,highly | source_url(optional)")
+    d, today = mw_data(), datetime.now(IST).date().isoformat()
+    old = d["states"].get(state)
+    d["states"][state] = dict(effective=eff, rates=rates, source=p[3] if len(p) > 3 else "", verified=today)
+    changed = not old or old["rates"] != rates
+    if changed:
+        d["changes"] = (d["changes"] + [dict(id=f"{state}|{eff}|{today}", state=state, effective=eff,
+                                              old=old and old["rates"], new=rates, announced=today)])[-100:]
+    save(MW, d)
+    await update.message.reply_text(f"✅ {state} saved." + (" Next daily alert me jayega." if changed else " (Rates same, sirf verified date update hui.)"))
+
+
+async def mwstatus_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not admin(update):
+        return await update.message.reply_text("Not authorised.")
+    st = mw_data()["states"]
+    lines = [f"Data added: {len(st)}/{len(STATES)}"] + [f"✅ {s} — effective {r['effective']}, verified {r.get('verified', 'n/a')}" for s, r in st.items()]
+    await update.message.reply_text("\n".join(lines + ["\nPending: " + ", ".join(s for s in STATES if s not in st)])[:4000])
+
+
+# ======================= NEWS / DAILY UPDATES =======================
+async def fetch_news(client, q):
+    r = await client.get("https://news.google.com/rss/search?q=" + quote_plus(q + " when:7d") + "&hl=en-IN&gl=IN&ceid=IN:en")
+    r.raise_for_status(); out = []
+    for it in ET.fromstring(r.content).iter("item"):
+        title, link = (it.findtext("title") or "").strip(), (it.findtext("link") or "").strip()
+        if not (title and link):
             continue
         try:
-            published = parsedate_to_datetime(it.findtext("pubDate")).astimezone(
-                timezone.utc
-            )
+            pub = parsedate_to_datetime(it.findtext("pubDate")).astimezone(timezone.utc)
         except (TypeError, ValueError):
-            published = datetime.now(timezone.utc)
-        items.append(
-            {
-                "title": title,
-                "link": link,
-                "source": (it.findtext("source") or "").strip(),
-                "published": published.isoformat(),
-            }
-        )
-    return items[:6]
+            pub = datetime.now(timezone.utc)
+        out.append(dict(title=title, link=link, source=(it.findtext("source") or "").strip(), published=pub.isoformat()))
+    return out[:6]
 
 
-async def refresh_updates(force=False):
-    cache = load_json(UPDATES_CACHE_FILE, {})
-    fetched_at = cache.get("fetched_at")
-    if not force and fetched_at:
-        age = datetime.now(timezone.utc) - datetime.fromisoformat(fetched_at)
-        if age < timedelta(hours=UPDATES_CACHE_TTL_HOURS):
-            return cache
-
-    try:
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-            results = await asyncio.gather(
-                *(fetch_news_query(client, q) for q in UPDATE_QUERIES),
-                return_exceptions=True,
-            )
-    except Exception:
-        logger.exception("Updates fetch failed")
+async def refresh(force=False):
+    cache = load(CACHE, {})
+    if not force and cache.get("fetched_at") and datetime.now(timezone.utc) - datetime.fromisoformat(cache["fetched_at"]) < timedelta(hours=6):
         return cache
-
-    merged, seen = [], set()
-    for res in results:
-        if isinstance(res, Exception):
-            logger.warning("News query failed: %s", res)
-            continue
-        for item in res:
-            key = item["title"].lower()
-            if key not in seen:
-                seen.add(key)
-                merged.append(item)
-    if not merged:
-        return cache  # keep whatever we had
-
-    merged.sort(key=lambda i: i["published"], reverse=True)
-    cache["items"] = merged[:MAX_UPDATE_ITEMS]
-    cache["fetched_at"] = datetime.now(timezone.utc).isoformat()
-    save_json(UPDATES_CACHE_FILE, cache)
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as c:
+            res = await asyncio.gather(*(fetch_news(c, q) for q in QUERIES), return_exceptions=True)
+    except Exception:
+        log.exception("news fetch failed"); return cache
+    seen, items = set(), []
+    for r in res:
+        for i in [] if isinstance(r, Exception) else r:
+            if i["title"].lower() not in seen:
+                seen.add(i["title"].lower()); items.append(i)
+    if items:
+        cache["items"] = sorted(items, key=lambda i: i["published"], reverse=True)[:30]
+        cache["fetched_at"] = datetime.now(timezone.utc).isoformat()
+        save(CACHE, cache)
     return cache
 
 
-def format_news_items(items, limit=8):
-    lines = []
-    for it in items[:limit]:
-        title = html.escape(it["title"])
-        link = html.escape(it["link"], quote=True)
-        source = html.escape(it.get("source") or "news")
-        day = datetime.fromisoformat(it["published"]).astimezone(IST).strftime("%d %b")
-        lines.append(f'• <a href="{link}">{title}</a> — {source}, {day}')
-    return "\n".join(lines)
+def news_lines(items, limit=8, extra=lambda i: ""):
+    return "\n".join(f'• <a href="{html.escape(i["link"], quote=True)}">{html.escape(i["title"])}</a>{extra(i)} — '
+                     f'{html.escape(i.get("source") or "news")}, {datetime.fromisoformat(i["published"]).astimezone(IST):%d %b}'
+                     for i in items[:limit])
 
 
-def format_minwage_alerts(changes, news):
-    """HTML block for verified (admin) changes + auto-detected headlines."""
-    lines = ["<b>💰 Minimum Wage Alerts</b>"]
+def mw_news(items):
+    out = []
+    for it in items:
+        t = it["title"].lower()
+        if "minimum wage" in t or re.search(r"\bvda\b", t) or "dearness allowance" in t:
+            out.append((it, [s for s in STATES if re.search(rf"\b{re.escape(s.lower())}\b", t)]))
+    return out
+
+
+def due_block(today=None, days=10):
+    today, due = today or datetime.now(IST).date(), []
+    for o in range(days + 1):
+        d = today + timedelta(days=o); s = f"{d:%d %b} ({'today' if o == 0 else f'in {o}d'})"
+        if d.day == 7: due.append(f"{s}: Salary processing, pay slips, TDS deposit")
+        if d.day == 15: due.append(f"{s}: EPF & ESIC payment")
+        if (d.month, d.day) in {(7, 31), (10, 31), (1, 31), (5, 31)}: due.append(f"{s}: TDS 24Q quarterly return")
+        if (d.month, d.day) == (6, 15): due.append(f"{s}: Form 16 to employees")
+    return "<b>⏳ Upcoming due dates</b>\n" + "\n".join("• " + html.escape(x) for x in due) + "\n\n" if due else ""
+
+
+def mw_alerts(changes, news):
+    L = ["<b>💰 Minimum Wage Alerts</b>"]
     for c in changes:
         n = c["new"]
-        lines.append(
-            f"• <b>{html.escape(c['state'])}</b> — revised, effective "
-            f"{html.escape(c['effective'])}: Unskilled ₹{n[0]:,.0f}, "
-            f"Semi ₹{n[1]:,.0f}, Skilled ₹{n[2]:,.0f}, Highly ₹{n[3]:,.0f}"
-        )
-    for it, states in news:
-        tag = f" [{html.escape(', '.join(states))}]" if states else ""
-        day = datetime.fromisoformat(it["published"]).astimezone(IST).strftime("%d %b")
-        lines.append(
-            f'• <a href="{html.escape(it["link"], quote=True)}">'
-            f'{html.escape(it["title"])}</a>{tag} — {day}'
-        )
-    lines.append(
-        "<i>Headlines auto-fetch hoti hain; rates /minwage me verify hone ke baad "
-        "update hote hain.</i>"
-    )
-    return "\n".join(lines)
+        L.append(f"• <b>{html.escape(c['state'])}</b> — effective {html.escape(c['effective'])}: Unskilled ₹{n[0]:,.0f}, "
+                 f"Semi ₹{n[1]:,.0f}, Skilled ₹{n[2]:,.0f}, Highly ₹{n[3]:,.0f}")
+    if news:
+        L.append(news_lines([i for i, _ in news], 99, lambda i: next((f" [{html.escape(', '.join(s))}]" for x, s in news if x is i and s), "")))
+    return "\n".join(L + ["<i>Headlines auto-fetch hoti hain; rates /minwage me verify hone ke baad update hote hain.</i>"])
 
 
-def upcoming_deadlines(today=None, window_days=10):
-    """Recurring due dates falling in the next `window_days` days."""
-    today = today or datetime.now(IST).date()
-    due = []
-    for offset in range(window_days + 1):
-        d = today + timedelta(days=offset)
-        label = "today" if offset == 0 else f"in {offset}d"
-        stamp = f"{d.strftime('%d %b')} ({label})"
-        if d.day == 7:
-            due.append(f"{stamp}: Salary processing, pay slips, TDS deposit (24Q)")
-        if d.day == 15:
-            due.append(f"{stamp}: EPF & ESIC payment")
-        if (d.month, d.day) in {(7, 31), (10, 31), (1, 31), (5, 31)}:
-            due.append(f"{stamp}: TDS 24Q quarterly return")
-        if (d.month, d.day) == (6, 15):
-            due.append(f"{stamp}: Form 16 to employees")
-    return due
+def cut(text, limit=4000):
+    if len(text) <= limit:
+        return text
+    t = text[:limit]; i = t.rfind("\n")
+    return t[:i] if i > 0 else t
 
 
-async def build_updates_message():
-    cache = await refresh_updates()
-    items = cache.get("items", [])
-    text = (
-        "📰 <b>Payroll &amp; Compliance Updates</b>\n\n"
-        "<b>Labour Codes:</b> 4 Labour Codes (Wages, IR, Social Security, OSH) "
-        "21 Nov 2025 se national level par lagu hain. States apne rules "
-        "phase-wise la rahe hain — apne state labour department ka status "
-        "check karo.\n\n"
-    )
-    due = upcoming_deadlines()
-    if due:
-        text += (
-            "<b>⏳ Upcoming due dates</b>\n"
-            + "\n".join("• " + html.escape(d) for d in due)
-            + "\n\n"
-        )
+async def updates_text():
+    cache = await refresh(); items = cache.get("items", [])
+    t = ("📰 <b>Payroll &amp; Compliance Updates</b>\n\n<b>Labour Codes:</b> 4 Labour Codes 21 Nov 2025 se national level par lagu hain. "
+         "States rules phase-wise la rahe hain — apne state labour department ka status check karo.\n\n" + due_block())
     if items:
-        mw_news = tag_minwage_news(items)[:4]
-        if mw_news:
-            text += (
-                "<b>💰 Minimum wage headlines</b> (state rates ke liye /minwage)\n"
-                + format_news_items([it for it, _ in mw_news], limit=4)
-                + "\n\n"
-            )
-        fetched = datetime.fromisoformat(cache["fetched_at"]).astimezone(IST)
-        text += (
-            f"<b>🗞 Latest headlines</b> (updated {fetched.strftime('%d %b, %H:%M')} IST)\n"
-            + format_news_items(items)
-            + "\n\n<i>Headlines news feeds se auto-fetch hoti hain — official "
-            "notification/circular se verify karke hi payroll me apply karo.</i>\n\n"
-        )
+        mw = mw_news(items)[:4]
+        if mw:
+            t += "<b>💰 Minimum wage headlines</b> (rates: /minwage)\n" + news_lines([i for i, _ in mw], 4) + "\n\n"
+        f = datetime.fromisoformat(cache["fetched_at"]).astimezone(IST)
+        t += f"<b>🗞 Latest headlines</b> (updated {f:%d %b, %H:%M} IST)\n" + news_lines(items) + "\n\n<i>Auto-fetched — official circular se verify karo.</i>\n\n"
     else:
-        text += "<i>Abhi live headlines fetch nahi ho payi. Thodi der baad try karo.</i>\n\n"
-    text += (
-        "<b>Official sources:</b> labour.gov.in • epfindia.gov.in • esic.gov.in • "
-        "incometax.gov.in\n" + html.escape(DISCLAIMER.strip())
-    )
-    return truncate_html(text)
+        t += "<i>Abhi live headlines fetch nahi ho payi. Thodi der baad try karo.</i>\n\n"
+    return cut(t + "<b>Sources:</b> labour.gov.in • epfindia.gov.in • esic.gov.in • incometax.gov.in\n" + html.escape(NOTE))
 
 
-async def broadcast_daily(app):
-    subs = get_subscribers()
+async def broadcast(app):
+    subs = set(load(SUBS, []))
     if not subs:
         return
-    cache = await refresh_updates(force=True)
-    items = cache.get("items", [])
-    sent_ids = set(cache.get("broadcast_ids", []))
-    cutoff = datetime.now(timezone.utc) - timedelta(days=2)
-    new_items = [
-        i
-        for i in items
-        if i["link"] not in sent_ids
-        and datetime.fromisoformat(i["published"]) >= cutoff
-    ]
-
-    # Minimum wage: verified changes not yet broadcast + new tagged headlines
-    mw_data = load_minwages()
-    mw_sent = set(cache.get("mw_sent", []))
-    new_mw_changes = [c for c in mw_data["changes"] if c["id"] not in mw_sent]
-    mw_news = tag_minwage_news(new_items)
-
-    today = datetime.now(IST)
-    text = f"🔔 <b>Daily Payroll &amp; Compliance Update — {today.strftime('%d %b %Y')}</b>\n\n"
-    due = upcoming_deadlines(today.date())
-    if due:
-        text += (
-            "<b>⏳ Upcoming due dates</b>\n"
-            + "\n".join("• " + html.escape(d) for d in due)
-            + "\n\n"
-        )
-    if new_mw_changes or mw_news:
-        text += format_minwage_alerts(new_mw_changes, mw_news) + "\n\n"
-    if new_items:
-        text += "<b>🗞 Naye headlines</b>\n" + format_news_items(new_items) + "\n\n"
-    else:
-        text += "Aaj labour code/compliance ke koi naye headlines nahi mile.\n\n"
-    text += "<i>Official notification se verify karo. /updates se poori list dekho, /minwage se state rates.</i>"
-    text = truncate_html(text)
-
-    for chat_id in list(subs):
+    cache = await refresh(True); items = cache.get("items", []); sent = set(cache.get("sent", []))
+    new = [i for i in items if i["link"] not in sent and datetime.fromisoformat(i["published"]) >= datetime.now(timezone.utc) - timedelta(days=2)]
+    mw = mw_data(); chg = [c for c in mw["changes"] if c["id"] not in set(cache.get("mw_sent", []))]; mwn = mw_news(new)
+    now = datetime.now(IST)
+    t = f"🔔 <b>Daily Payroll &amp; Compliance Update — {now:%d %b %Y}</b>\n\n" + due_block(now.date())
+    if chg or mwn:
+        t += mw_alerts(chg, mwn) + "\n\n"
+    t += ("<b>🗞 Naye headlines</b>\n" + news_lines(new) + "\n\n") if new else "Aaj koi naye headlines nahi mile.\n\n"
+    t = cut(t + "<i>Official notification se verify karo. /updates, /minwage</i>")
+    for cid in list(subs):
         try:
-            kwargs = {"parse_mode": "HTML"}
-            if LinkPreviewOptions is not None:
-                kwargs["link_preview_options"] = LinkPreviewOptions(is_disabled=True)
-            else:
-                kwargs["disable_web_page_preview"] = True
-            await app.bot.send_message(chat_id=chat_id, text=text, **kwargs)
+            await app.bot.send_message(cid, t, parse_mode="HTML", link_preview_options=NOPREV)
         except (Forbidden, BadRequest):
-            subs.discard(chat_id)  # blocked the bot / chat gone
+            subs.discard(cid)
         except Exception:
-            logger.exception("Broadcast to %s failed", chat_id)
-        await asyncio.sleep(0.05)  # stay under Telegram rate limits
-
-    save_json(SUBSCRIBERS_FILE, sorted(subs))
-    cache["broadcast_ids"] = [i["link"] for i in items]
-    cache["mw_sent"] = [c["id"] for c in mw_data["changes"]]
-    save_json(UPDATES_CACHE_FILE, cache)
+            log.exception("broadcast to %s failed", cid)
+        await asyncio.sleep(0.05)
+    save(SUBS, sorted(subs))
+    cache.update(sent=[i["link"] for i in items], mw_sent=[c["id"] for c in mw["changes"]]); save(CACHE, cache)
 
 
 async def daily_loop(app):
     while True:
-        now = datetime.now(IST)
-        target = now.replace(
-            hour=DAILY_UPDATE_HOUR_IST, minute=0, second=0, microsecond=0
-        )
-        if target <= now:
-            target += timedelta(days=1)
-        await asyncio.sleep((target - now).total_seconds())
+        now = datetime.now(IST); nxt = now.replace(hour=DAILY_H, minute=0, second=0, microsecond=0)
+        await asyncio.sleep(((nxt + timedelta(days=1) if nxt <= now else nxt) - now).total_seconds())
         try:
-            await broadcast_daily(app)
+            await broadcast(app)
         except Exception:
-            logger.exception("Daily broadcast failed")
+            log.exception("daily broadcast failed")
 
 
-async def post_init(app):
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    app.bot_data["daily_task"] = asyncio.create_task(daily_loop(app))
+# ======================= HANDLERS =======================
+send_html = lambda msg, text, **kw: msg.reply_text(text, parse_mode="HTML", link_preview_options=NOPREV, **kw)
 
 
-async def post_shutdown(app):
-    task = app.bot_data.get("daily_task")
-    if task:
-        task.cancel()
+async def toggle_sub(msg, force=None):
+    subs = set(load(SUBS, [])); on = (msg.chat_id not in subs) if force is None else force
+    (subs.add if on else subs.discard)(msg.chat_id); save(SUBS, sorted(subs))
+    await msg.reply_text(f"🔔 Daily alerts ON. Roz subah {DAILY_H}:00 IST par headlines, min wage changes aur due dates milenge. Band: /unsubscribe"
+                         if on else "🔕 Daily alerts OFF. Dobara chalu: /subscribe")
 
 
-# ---------------- AFTER-HOURS NOTICE ----------------
+async def route(key, msg, ctx):
+    if key.startswith("calc_"):
+        ctx.user_data["calc"] = key[5:]; await msg.reply_text(prompt(key[5:]))
+    elif key == "mw_menu":
+        await msg.reply_text("💰 State chuno (minimum wages):", reply_markup=mw_kb())
+    elif key.startswith("mw_"):
+        await send_html(msg, mw_text(STATES[int(key[3:])]))
+    elif key in ("info_subscribe", "sub_on", "sub_off"):
+        await toggle_sub(msg, {"sub_on": True, "sub_off": False}.get(key))
+    elif key == "info_updates":
+        subd = msg.chat_id in set(load(SUBS, []))
+        await send_html(msg, await updates_text(), reply_markup=Kb([[Btn("🔕 Daily alerts band karo" if subd else "🔔 Daily alerts chalu karo", callback_data="info_subscribe")]]))
+    elif key in INFO:
+        kb = Kb([[Btn("🧮 Compare Old vs New", callback_data="calc_tds")]]) if key == "info_taxsave" else None
+        await msg.reply_text(INFO[key], parse_mode="Markdown", reply_markup=kb)
 
 
-def is_office_hours(now=None):
-    now = now or datetime.now(IST)
-    return OFFICE_START_HOUR <= now.hour < OFFICE_END_HOUR
+def cmd_for(key):
+    async def h(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        await route(key, update.message, ctx)
+    return h
 
 
-async def after_hours_notice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Runs before every other handler (group -1); never blocks them."""
-    if is_office_hours() or not update.effective_chat:
-        return
-    # Only react to real user actions (messages / button taps)
-    if not (update.message or update.callback_query):
-        return
-    last = context.user_data.get("after_hours_notice_at")
-    now = datetime.now(timezone.utc)
-    if last and now - datetime.fromisoformat(last) < timedelta(
-        hours=AFTER_HOURS_NOTICE_GAP_HOURS
-    ):
-        return
-    context.user_data["after_hours_notice_at"] = now.isoformat()
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data.pop("calc", None)
+    await update.message.reply_text("👋 *Welcome to PayrollPath India!*\n\nFree HR & payroll compliance assistant.\n"
+                                    "Har calculator ka result *table image + Excel (formulas ke saath)* me milega.",
+                                    parse_mode="Markdown", reply_markup=menu())
+
+
+async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("ℹ️ /start = menu\nCalculators: " + " ".join("/" + k for k in SPECS) + " /regime\n"
+                                    "Info: /taxsave /compliance /updates /minwage /templates /premium\n"
+                                    "Alerts: /subscribe /unsubscribe   Data: /export   Cancel: /cancel")
+
+
+async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data.pop("calc", None); await update.message.reply_text("Cancelled. /start se dobara shuru karo.")
+
+
+async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer(); await route(update.callback_query.data, update.callback_query.message, ctx)
+
+
+async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    key = ctx.user_data.get("calc")
+    if not key:
+        return await update.message.reply_text("Samajh nahi aaya. /start karke menu se try karo, ya /help dekho.")
     try:
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=(
-                f"🕙 Hamari support timing {OFFICE_START_HOUR % 12 or 12}:00 AM – "
-                f"{OFFICE_END_HOUR % 12 or 12}:00 PM (IST) hai. Is time ke baad "
-                "message karne par reply late aa sakta hai. Calculators phir bhi "
-                "kaam karte rahenge."
-            ),
-        )
-    except Exception:
-        logger.exception("After-hours notice failed")
+        await calc_reply(update.message, key, update.message.text)
+        ctx.user_data.pop("calc", None)
+    except (ValueError, OverflowError, ZeroDivisionError):
+        await update.message.reply_text("⚠️ Input sahi format me bhejo.\n\n" + prompt(key))
 
 
-# ---------------- ROUTER ----------------
+async def export_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    wb = Workbook(); ws = wb.active; ws.title = "Updates"; ws.append(["Title", "Source", "Published", "Link"])
+    for i in load(CACHE, {}).get("items", []):
+        ws.append([i["title"], i.get("source", ""), i["published"][:10], i["link"]])
+    w2 = wb.create_sheet("Minimum Wages")
+    w2.append(["State", "Effective", "Unskilled", "Semi-skilled", "Skilled", "Highly skilled", "Verified", "Source"])
+    for s, r in mw_data()["states"].items():
+        w2.append([s, r["effective"], *r["rates"], r.get("verified", ""), r.get("source", "")])
+    for w, n in ((ws, "UpdatesTbl"), (w2, "MinWageTbl")):
+        hdr_style(w); as_table(w, n)
+    out = BytesIO(); wb.save(out); out.seek(0)
+    await update.message.reply_document(out, filename="PayrollPath_Data.xlsx", caption="📊 Updates + Minimum Wages (Excel table)")
 
 
-async def route(key, update, context, via_button):
-    if key in CALC_PROMPTS:
-        return await calc_entry(key, update, context, via_button)
-    elif key == "info_subscribe":
-        await toggle_subscription(update, context)
-        return ConversationHandler.END
-    elif key in INFO_TEXT:
-        await send_info(key, update, context, via_button)
-        return ConversationHandler.END
-    return ConversationHandler.END
-
-
-# Direct command versions (e.g. /pf) also open the same calculator flow
-async def direct_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cmd = update.message.text.split()[0][1:].split("@")[0]  # strip "/" and @botname
-    key = f"calc_{cmd}"
-    if key in CALC_PROMPTS:
-        return await calc_entry(key, update, context, via_button=False)
-    info_key = f"info_{cmd}"
-    if info_key in INFO_TEXT:
-        await send_info(info_key, update, context, via_button=False)
-        return ConversationHandler.END
-    return ConversationHandler.END
-
-
-async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Sorry, samajh nahi aaya. /start karke menu se try karo, ya /help dekho."
-    )
+async def after_hours(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    now = datetime.now(timezone.utc); last = ctx.user_data.get("ah")
+    if OPEN_H <= datetime.now(IST).hour < CLOSE_H or not (update.message or update.callback_query) or (last and now - last < timedelta(hours=6)):
+        return
+    ctx.user_data["ah"] = now
+    await ctx.bot.send_message(update.effective_chat.id, f"🕙 Support timing {OPEN_H % 12 or 12}:00 AM – {CLOSE_H % 12 or 12}:00 PM (IST). "
+                               "Is time ke baad reply late aa sakta hai. Calculators 24x7 chalte hain.")
 
 
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN not set. Add it in Replit Secrets.")
 
-    app = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .post_init(post_init)
-        .post_shutdown(post_shutdown)
-        .build()
-    )
+    async def post_init(app):
+        DATA.mkdir(parents=True, exist_ok=True); app.bot_data["task"] = asyncio.create_task(daily_loop(app))
 
-    calc_commands = [
-        "pf",
-        "esic",
-        "ctc",
-        "ctc_new",
-        "regime",
-        "salary",
-        "gratuity",
-        "bonus",
-        "tds",
-        "leave",
-        "ot",
-    ]
-    info_commands = ["compliance", "updates", "taxsave", "templates", "premium"]
+    async def post_shutdown(app):
+        if app.bot_data.get("task"):
+            app.bot_data["task"].cancel()
 
-    conv = ConversationHandler(
-        entry_points=(
-            [CallbackQueryHandler(menu_callback, pattern="^(calc_|info_)")]
-            + [CommandHandler(c, direct_command) for c in calc_commands]
-        ),
-        states={
-            AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_amount)],
-            TAX_REGIME: [
-                CallbackQueryHandler(select_tax_regime, pattern="^taxreg_(new|old)$"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, remind_tax_regime),
-            ],
-            OLD_AGE: [
-                CallbackQueryHandler(
-                    select_old_regime_age,
-                    pattern="^taxage_(under_60|60_to_79|80_plus)$",
-                ),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, remind_old_regime_age),
-            ],
-            OLD_DEDUCTIONS: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_old_deductions)
-            ],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-            CommandHandler("start", restart_conversation),
-        ],
-        allow_reentry=True,
-    )
-
-    app.add_handler(TypeHandler(Update, after_hours_notice), group=-1)
-    app.add_handler(conv)
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("subscribe", subscribe_cmd))
-    app.add_handler(CommandHandler("unsubscribe", unsubscribe_cmd))
-
-
-    # Minimum wages
-    app.add_handler(CallbackQueryHandler(minwage_callback, pattern="^mw_"))
-    app.add_handler(CommandHandler("minwage", minwage_cmd))
-    app.add_handler(CommandHandler("setwage", setwage_cmd))
-    app.add_handler(CommandHandler("mwstatus", mwstatus_cmd))
-
-    # Excel export
-    app.add_handler(CommandHandler("export", export_cmd))
-
-    for c in info_commands:
-        app.add_handler(CommandHandler(c, direct_command))
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, pending_amount_fallback)
-    )
-
-    app.add_handler(MessageHandler(filters.COMMAND, unknown))
-
-    print("Bot is running...")
-    app.run_polling()
-
-
-# ---------------- EXCEL EXPORT ----------------
-from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment
-from openpyxl.utils import get_column_letter
-
-
-def _load_json(path):
-    try:
-        return json.loads(Path(path).read_text(encoding="utf-8"))
-    except Exception:
-        return None
-
-
-def _to_rows(data):
-    if not data:
-        return []
-    if isinstance(data, list):
-        return [r if isinstance(r, dict) else {"Value": r} for r in data]
-    if isinstance(data, dict):
-        for v in data.values():
-            if isinstance(v, list) and v and isinstance(v[0], dict):
-                return v
-        if all(isinstance(v, dict) for v in data.values()):
-            return [{"Key": k, **v} for k, v in data.items()]
-        return [{"Key": k, "Value": v} for k, v in data.items()]
-    return [{"Value": data}]
-
-
-def _cell(v):
-    if isinstance(v, (dict, list)):
-        return json.dumps(v, ensure_ascii=False)
-    return v
-
-
-def _write_sheet(ws, rows):
-    if not rows:
-        ws.append(["No data available"])
-        return
-    headers = []
-    for r in rows:
-        for k in r:
-            if k not in headers:
-                headers.append(k)
-    ws.append([str(h).replace("_", " ").title() for h in headers])
-    for r in rows:
-        ws.append([_cell(r.get(h)) for h in headers])
-    fill = PatternFill("solid", fgColor="1F4E78")
-    for c in ws[1]:
-        c.font = Font(bold=True, color="FFFFFF")
-        c.fill = fill
-        c.alignment = Alignment(horizontal="center", vertical="center")
-    for i, col in enumerate(ws.columns, 1):
-        width = max(len(str(c.value or "")) for c in col) + 2
-        ws.column_dimensions[get_column_letter(i)].width = min(width, 60)
-        for c in col:
-            c.alignment = Alignment(wrap_text=True, vertical="top")
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = ws.dimensions
-
-
-def build_excel():
-    wb = Workbook()
-    ws1 = wb.active
-    ws1.title = "Updates"
-    _write_sheet(ws1, _to_rows(_load_json(UPDATES_CACHE_FILE)))
-    ws2 = wb.create_sheet("Minimum Wages")
-    _write_sheet(ws2, _to_rows(_load_json(MINWAGE_FILE)))
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    out = DATA_DIR / "PayrollPath_Data.xlsx"
-    wb.save(out)
-    return out
-
-
-async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    out = build_excel()
-    with open(out, "rb") as f:
-        await update.message.reply_document(
-            f,
-            filename="PayrollPath_Data.xlsx",
-            caption="📊 Updates + Minimum Wages (Excel table)",
-        )
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
+    app.add_handler(TypeHandler(Update, after_hours), group=-1)
+    for name, fn in (("start", start), ("help", help_cmd), ("cancel", cancel), ("setwage", setwage_cmd),
+                     ("mwstatus", mwstatus_cmd), ("export", export_cmd)):
+        app.add_handler(CommandHandler(name, fn))
+    for k in SPECS:
+        app.add_handler(CommandHandler(k, cmd_for("calc_" + k)))
+    for name, key in [("regime", "calc_tds"), ("minwage", "mw_menu"), ("subscribe", "sub_on"), ("unsubscribe", "sub_off")] + \
+                     [(k, "info_" + k) for k in ("compliance", "updates", "taxsave", "templates", "premium")]:
+        app.add_handler(CommandHandler(name, cmd_for(key)))
+    app.add_handler(CallbackQueryHandler(on_button, pattern="^(calc_|info_|mw_)"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_handler(MessageHandler(filters.COMMAND, on_text))
+    print("Bot is running..."); app.run_polling()
 
 
 if __name__ == "__main__":
