@@ -100,13 +100,8 @@ SPECS = {
                  rows=WB[:1] + [ESIC_OK, ("ee", "Employee 0.75%", "ROUND({wb}*0.0075,0)*{ok}", ""),
                                 ("er", "Employer 3.25%", "ROUND({wb}*0.0325,0)*{ok}", ""),
                                 ("tot", "Total contribution", "{ee}+{er}", "")], res=["ee", "er"]),
-    "ctc": dict(title="Standard CTC Breakup", ex="600000", inputs=[("ctc", "Annual CTC", None)],
-                rows=[("m", "Monthly CTC", "{ctc}/12", ""), ("basic", "Basic+DA (40%)", "{m}*0.4", "Illustrative"),
-                      ("hra", "HRA (50% of Basic)", "{basic}*0.5", ""),
-                      ("pf", "Employer PF 12%", "ROUND(MIN({basic},25000)*0.12,0)", ""),
-                      ("oth", "Other allowances (balance)", "{m}-{basic}-{hra}-{pf}", "")], res=["basic", "hra", "oth"]),
-    "ctc_new": dict(title="New Wage CTC Breakup", ex="600000  or  600000,12000", solve=True,
-                    inputs=[("ctc", "Annual CTC", None), ("ins", "Annual insurance/benefits", 0), ("gross", "Monthly gross (auto-solved)", 0)],
+    "ctc_new": dict(title="CTC Breakup (New Wage Code, Basic+DA >= 50%)", ex="600000  or  600000,12000,9000", solve=True,
+                    inputs=[("ctc", "Annual CTC", None), ("ins", "Annual insurance/benefits", 0), ("mw", "State minimum wage (for bonus ceiling)", 0), ("gross", "Monthly gross (auto-solved)", 0)],
                     chk=lambda v: v["ctc"] >= 50000 and v["ins"] < v["ctc"] * .5,
                     rows=[SEC("Earnings (monthly)"), ("basic", "Basic+DA (>=50%)", "CEILING({gross}/2,1)", ""),
                           ("hra", "HRA (50% of Basic)", "ROUND({basic}*0.5,0)", "Illustrative"),
@@ -116,7 +111,7 @@ SPECS = {
                           ("adm", "EPF admin + EDLI 1%", "ROUND({pfw}*0.01,0)", ""), ESIC_OK,
                           ("eer", "Employer ESIC 3.25%", "ROUND({wb}*0.0325,0)*{ok}", ""),
                           ("grat", "Gratuity provision", "ROUND({basic}*15/26/12,0)", "4.81% of Basic"),
-                          ("bon", "Bonus provision 8.33%", "IF({basic}<=21000,ROUND({basic}*0.0833,0),0)", "Statutory minimum"),
+                          ("bon", "Bonus provision 8.33%", "IF({wb}<=21000,ROUND(MIN({wb},MAX(7000,{mw}))*0.0833,0),0)", "On ceiling = max(7,000, min wage)"),
                           ("insm", "Insurance/benefits", "{ins}/12", ""),
                           ("total", "Total monthly cost (<= CTC/12)", "{gross}+{er}+{adm}+{eer}+{grat}+{bon}+{insm}", "Gross + employer side"),
                           ("tgt", "Monthly CTC", "{ctc}/12", ""),
@@ -139,18 +134,25 @@ SPECS = {
                         + [SEC("Net pay"), ("net_n", "Net pay - New regime", "{gross}-{epf}-{esic}-{n_mt}", "PT not included"),
                            ("net_o", "Net pay - Old regime", "{gross}-{epf}-{esic}-{o_mt}", "PT not included")],
                    res=["net_n", "net_o"]),
-    "gratuity": dict(title="Gratuity", ex="20000,6", inputs=[("basic", "Last drawn Basic+DA", None), ("years", "Years of service", None)],
-                     rows=[("ok", "Eligible? (1=yes, >=5 years)", "IF({years}>=5,1,0)", "Fixed-term rules may differ"),
-                           ("amt", "Gratuity amount", "{basic}*15*{years}/26*{ok}", "Basic x 15 x Years / 26")], res=["amt"]),
-    "bonus": dict(title="Statutory Bonus", ex="15000", inputs=[("wage", "Monthly wage", None)],
-                  rows=[("ok", "Eligible? (1=yes, wage <= 21,000)", "IF({wage}<=21000,1,0)", ""),
-                        ("mn", "Minimum bonus 8.33% (annual)", "{wage}*12*0.0833*{ok}", ""),
-                        ("mx", "Maximum bonus 20% (annual)", "{wage}*12*0.2*{ok}", "")], res=["mn", "mx"]),
-    "leave": dict(title="Leave Encashment", ex="24000,15", inputs=[("basic", "Monthly Basic+DA", None), ("days", "EL days", None)],
-                  rows=[("pd", "Per day rate", "{basic}/30", "30-day divisor; follow company policy"),
-                        ("amt", "Encashment amount", "{pd}*{days}", "")], res=["amt"]),
-    "ot": dict(title="Overtime Pay", ex="150,10", inputs=[("rate", "Hourly rate", None), ("hrs", "Overtime hours", None)],
-               rows=[("amt", "Overtime pay (2x rate)", "{rate}*2*{hrs}", "")], res=["amt"]),
+    "gratuity": dict(title="Gratuity (Code on Social Security)", ex="40000,20000,6,0", chk=lambda v: v["basic"] <= v["gross"],
+                     inputs=GB + [("years", "Years of service", None), ("ft", "Fixed-term employee? (1=yes, 0=no)", 0)],
+                     rows=WB[:1] + [("ok", "Eligible? (1=yes)", "IF({ft}<=0,IF({years}>=5,1,0),IF({years}>=1,1,0))", "Permanent 5 yrs; fixed-term 1 yr (pro-rata)"),
+                                    ("yrs", "Completed years", "ROUND({years},0)", "Part-year over 6 months = 1 year"),
+                                    ("amt", "Gratuity (max 20,00,000)", "MIN({wb}*15/26*{yrs}*{ok},2000000)", "Wages x 15 / 26 x Years")], res=["amt"]),
+    "bonus": dict(title="Statutory Bonus (Code on Wages)", ex="20000,10000,9000", chk=lambda v: v["basic"] <= v["gross"],
+                  inputs=GB + [("mw", "State minimum wage (monthly)", 0)],
+                  rows=WB[:1] + [("ok", "Eligible? (1=yes, wage <= 21,000)", "IF({wb}<=21000,1,0)", "Eligibility ceiling"),
+                                 ("cw", "Bonus calculation wage", "MIN({wb},MAX(7000,{mw}))", "Ceiling: higher of 7,000 or min wage"),
+                                 ("mn", "Minimum bonus 8.33% (annual)", "{cw}*12*0.0833*{ok}", ""),
+                                 ("mx", "Maximum bonus 20% (annual)", "{cw}*12*0.2*{ok}", "")], res=["mn", "mx"]),
+    "leave": dict(title="Leave Encashment", ex="40000,20000,15", chk=lambda v: v["basic"] <= v["gross"],
+                  inputs=GB + [("days", "EL days to encash", None)],
+                  rows=WB[:1] + [("pd", "Per day rate (wages / 30)", "{wb}/30", "30-day divisor; follow company policy"),
+                                 ("amt", "Encashment amount", "{pd}*{days}", "")], res=["amt"]),
+    "ot": dict(title="Overtime Pay (2x wages)", ex="30000,15000,10", chk=lambda v: v["basic"] <= v["gross"],
+               inputs=GB + [("hrs", "Overtime hours", None)],
+               rows=WB[:1] + [("hr", "Normal hourly rate", "{wb}/26/8", "Wages / 26 days / 8 hrs; follow policy"),
+                              ("amt", "Overtime pay (2x rate)", "{hr}*2*{hrs}", "Beyond 8 hrs/day or 48 hrs/week")], res=["amt"]),
 }
 
 
@@ -288,7 +290,7 @@ INFO = {
     "info_templates": "📁 *HR Templates*\n\nComing soon: offer/appointment letters, payslip, FnF settlement formats.",
     "info_premium": "⭐ *Premium*\n\nPlanned: bulk payroll reports, state-wise compliance tracker, auto payslips.",
 }
-MENU = [("🏦 PF", "calc_pf"), ("🏥 ESIC", "calc_esic"), ("📊 CTC Breakup", "calc_ctc"), ("🆕 New Wage CTC", "calc_ctc_new"),
+MENU = [("🏦 PF", "calc_pf"), ("🏥 ESIC", "calc_esic"), ("📊 CTC Breakup (New Wage)", "calc_ctc_new"),
         ("💵 Net Salary", "calc_salary"), ("🎁 Gratuity", "calc_gratuity"), ("🎯 Bonus", "calc_bonus"),
         ("🏖 Leave Encashment", "calc_leave"), ("🧾 TDS Old vs New", "calc_tds"), ("⏰ Overtime", "calc_ot"),
         ("💰 State Min Wages", "mw_menu"), ("📆 Compliance Calendar", "info_compliance"), ("📰 Updates", "info_updates"),
@@ -608,7 +610,7 @@ def main():
         app.add_handler(CommandHandler(name, fn))
     for k in SPECS:
         app.add_handler(CommandHandler(k, cmd_for("calc_" + k)))
-    for name, key in [("regime", "calc_tds"), ("minwage", "mw_menu"), ("subscribe", "sub_on"), ("unsubscribe", "sub_off")] + \
+    for name, key in [("regime", "calc_tds"), ("ctc", "calc_ctc_new"), ("minwage", "mw_menu"), ("subscribe", "sub_on"), ("unsubscribe", "sub_off")] + \
                      [(k, "info_" + k) for k in ("compliance", "updates", "taxsave", "templates", "premium")]:
         app.add_handler(CommandHandler(name, cmd_for(key)))
     app.add_handler(CallbackQueryHandler(on_button, pattern="^(calc_|info_|mw_)"))
