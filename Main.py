@@ -1770,23 +1770,110 @@ def main():
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("subscribe", subscribe_cmd))
     app.add_handler(CommandHandler("unsubscribe", unsubscribe_cmd))
+
+
     # Minimum wages
     app.add_handler(CallbackQueryHandler(minwage_callback, pattern="^mw_"))
     app.add_handler(CommandHandler("minwage", minwage_cmd))
     app.add_handler(CommandHandler("setwage", setwage_cmd))
     app.add_handler(CommandHandler("mwstatus", mwstatus_cmd))
+
+    # Excel export
+    app.add_handler(CommandHandler("export", export_cmd))
+
     for c in info_commands:
         app.add_handler(CommandHandler(c, direct_command))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, pending_amount_fallback)
     )
+
     app.add_handler(MessageHandler(filters.COMMAND, unknown))
 
     print("Bot is running...")
     app.run_polling()
 
 
-# PASTE NEW EXCEL IMAGE CODE HERE
+# ---------------- EXCEL EXPORT ----------------
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
+
+
+def _load_json(path):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _to_rows(data):
+    if not data:
+        return []
+    if isinstance(data, list):
+        return [r if isinstance(r, dict) else {"Value": r} for r in data]
+    if isinstance(data, dict):
+        for v in data.values():
+            if isinstance(v, list) and v and isinstance(v[0], dict):
+                return v
+        if all(isinstance(v, dict) for v in data.values()):
+            return [{"Key": k, **v} for k, v in data.items()]
+        return [{"Key": k, "Value": v} for k, v in data.items()]
+    return [{"Value": data}]
+
+
+def _cell(v):
+    if isinstance(v, (dict, list)):
+        return json.dumps(v, ensure_ascii=False)
+    return v
+
+
+def _write_sheet(ws, rows):
+    if not rows:
+        ws.append(["No data available"])
+        return
+    headers = []
+    for r in rows:
+        for k in r:
+            if k not in headers:
+                headers.append(k)
+    ws.append([str(h).replace("_", " ").title() for h in headers])
+    for r in rows:
+        ws.append([_cell(r.get(h)) for h in headers])
+    fill = PatternFill("solid", fgColor="1F4E78")
+    for c in ws[1]:
+        c.font = Font(bold=True, color="FFFFFF")
+        c.fill = fill
+        c.alignment = Alignment(horizontal="center", vertical="center")
+    for i, col in enumerate(ws.columns, 1):
+        width = max(len(str(c.value or "")) for c in col) + 2
+        ws.column_dimensions[get_column_letter(i)].width = min(width, 60)
+        for c in col:
+            c.alignment = Alignment(wrap_text=True, vertical="top")
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+
+
+def build_excel():
+    wb = Workbook()
+    ws1 = wb.active
+    ws1.title = "Updates"
+    _write_sheet(ws1, _to_rows(_load_json(UPDATES_CACHE_FILE)))
+    ws2 = wb.create_sheet("Minimum Wages")
+    _write_sheet(ws2, _to_rows(_load_json(MINWAGE_FILE)))
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    out = DATA_DIR / "PayrollPath_Data.xlsx"
+    wb.save(out)
+    return out
+
+
+async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    out = build_excel()
+    with open(out, "rb") as f:
+        await update.message.reply_document(
+            f,
+            filename="PayrollPath_Data.xlsx",
+            caption="📊 Updates + Minimum Wages (Excel table)",
+        )
 
 
 if __name__ == "__main__":
