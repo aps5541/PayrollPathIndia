@@ -16,6 +16,6 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt
-      - run: timeout 5h50m python Main.py || true
+      - run: timeout 5h50m python Main.py
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
