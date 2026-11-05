@@ -16,6 +16,8 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt
-      - run: timeout 350m python Main.py
+      - run: |
+          timeout 350m python Main.py || code=$?
+          [ "${code:-0}" -eq 124 ] && exit 0 || exit ${code:-0}
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
